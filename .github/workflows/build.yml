@@ -15,9 +15,13 @@ jobs:
       - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
         with:
           node-version: '22'
+      - name: Install Perl cryptography dependency
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libcryptx-perl
       - name: Test backend and packaging integration
         run: |
-          prove -I src tests/backend.t
+          prove -I src tests/*.t
           perl scripts/test-package-integration.pl
       - name: Check frontend syntax
         run: |

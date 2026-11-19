@@ -4,6 +4,8 @@ use warnings;
 use utf8;
 
 use File::Temp qw(tempdir tempfile);
+use Digest::SHA qw(sha256_hex);
+use Encode qw(encode_utf8);
 use IPC::Open3 ();
 use JSON::PP ();
 use MIME::Base64 qw(decode_base64 encode_base64);
@@ -31,8 +33,10 @@ BEGIN {
     package PVE::RPCEnvironment;
     $INC{'PVE/RPCEnvironment.pm'} = __FILE__;
     our $user = 'test@pve';
+    our @workers;
     sub get { return bless {}, __PACKAGE__; }
     sub get_user { return $user; }
+    sub fork_worker { push @workers, $_[4]; return 'UPID:fixture'; }
 
     package PVE::QemuConfig;
     $INC{'PVE/QemuConfig.pm'} = __FILE__;
@@ -51,7 +55,7 @@ BEGIN {
     use Exporter 'import';
     our @EXPORT_OK = qw(raise raise_param_exc raise_perm_exc);
     sub raise { die $_[0]; }
-    sub raise_param_exc { die $_[0]{actions}; }
+    sub raise_param_exc { die $_[0]{actions} // $_[0]{value}; }
     sub raise_perm_exc { die "Permission denied: $_[0]\n"; }
 
     package PVE::RESTHandler;
@@ -125,7 +129,11 @@ subtest 'Validate and save guest actions' => sub {
 
 subtest 'Require root PAM on all endpoints' => sub {
     is_deeply([map { "$_->{method} $_->{path}" } @PVE::RESTHandler::methods],
-        ['GET {type}/{vmid}', 'PUT {type}/{vmid}', 'POST {type}/{vmid}/run'], 'registers the API routes');
+        [
+            'GET {type}/{vmid}', 'PUT {type}/{vmid}', 'GET {type}/{vmid}/secrets',
+            'PUT {type}/{vmid}/secrets', 'DELETE {type}/{vmid}/secrets', 'POST {type}/{vmid}/run',
+        ],
+        'registers the API routes');
     for my $method (@PVE::RESTHandler::methods) {
         ok($method->{protected} && !$method->{allowtoken}, "$method->{method} requires pvedaemon and a ticket");
         for my $user ('test@pve', 'root@pam!token') {
@@ -138,12 +146,92 @@ subtest 'Require root PAM on all endpoints' => sub {
     ok(PVE::EasyActions::API::admin_environment(), 'accepts the PAM root account');
 };
 
+subtest 'Validate secret bindings and preserve legacy actions' => sub {
+    my $action = { name => 'Secrets', steps => [{ name => 'Test', command => 'true', timeout => 10 }] };
+    is_deeply(PVE::EasyActions::Config::validate_actions([$action]), [$action],
+        'an older action called Secrets stays valid');
+    my $binding = { name => 'deploy_key', env => 'DEPLOY_KEY_FILE', mode => 'file' };
+    $action->{secrets} = [$binding];
+    is_deeply(PVE::EasyActions::Config::validate_actions([$action]), [$action],
+        'retains the binding rather than a secret value');
+    $action->{secrets} = [$binding, { %$binding, name => 'other_key' }];
+    eval { PVE::EasyActions::Config::validate_actions([$action]); };
+    like($@, qr/same environment variable/, 'rejects ambiguous bindings');
+    $action->{secrets} = [{ %$binding, env => 'BASH_ENV' }];
+    eval { PVE::EasyActions::Config::validate_actions([$action]); };
+    like($@, qr/reserved secret environment variable/, 'protects shell control variables');
+};
+
+SKIP: {
+    skip 'Vault API integration requires Linux and CryptX', 1
+        if $^O ne 'linux' || !eval { require Crypt::AuthEnc::GCM; 1 };
+
+    subtest 'Save, bind and rotate a secret without returning its value' => sub {
+        require PVE::EasyActions::Secrets;
+        my $fixture = tempdir(CLEANUP => 1);
+        my $config_path = "$fixture/lxc-123.json";
+        my $key_directory = "$fixture/keys";
+        my %endpoints = map { $_->{name} => $_->{code} } @PVE::RESTHandler::methods;
+        my %guest = (node => 'fixture', type => 'lxc', vmid => 123);
+        my $read = \&PVE::EasyActions::Secrets::read_vault;
+        my $write = \&PVE::EasyActions::Secrets::write_vault;
+        my @resolved;
+
+        no warnings 'redefine';
+        local $PVE::RPCEnvironment::user = 'root@pam';
+        local @PVE::RPCEnvironment::workers;
+        local *PVE::EasyActions::API::config_path = sub { return $config_path; };
+        local *PVE::EasyActions::API::guest_context = sub { return ('a' x 64, {}); };
+        local *PVE::EasyActions::Secrets::read_vault = sub {
+            return $read->($_[0], $_[1], $key_directory);
+        };
+        local *PVE::EasyActions::Secrets::write_vault = sub {
+            return $write->($_[0], $_[1], $key_directory, $_[3]);
+        };
+        local *PVE::EasyActions::Runner::run_action = sub { push @resolved, $_[4][0]{value}; };
+
+        my $initial = $endpoints{get_secrets}->({ %guest });
+        is_deeply($initial->{secrets}, [], 'empty secret list');
+        my $saved = $endpoints{save_secret}->({
+            %guest, revision => $initial->{revision}, name => 'deploy_key', value => "fixture-key-v1\n",
+        });
+        is_deeply($saved, $endpoints{get_secrets}->({ %guest }), 'save and list have the same metadata');
+        is_deeply([sort keys %{ $saved->{secrets}[0] }], ['name', 'updatedAt'], 'metadata contains no value');
+
+        my $action = {
+            name => 'Deploy',
+            steps => [{ name => 'Test', command => 'true', timeout => 10 }],
+            secrets => [{ name => 'deploy_key', env => 'DEPLOY_KEY_FILE', mode => 'file' }],
+        };
+        my $current = $endpoints{get_actions}->({ %guest });
+        my $config = $endpoints{save_actions}->({
+            %guest, revision => $current->{revision}, actions => JSON::PP->new->encode([$action]),
+        });
+        is_deeply($config->{actions}, [$action], 'action config contains the binding only');
+        eval {
+            $endpoints{delete_secret}->({ %guest, revision => $saved->{revision}, name => 'deploy_key' });
+        };
+        like($@, qr/assigned to an action/, 'protects secrets that still have bindings');
+        my %run = (%guest, revision => $config->{revision}, name => 'Deploy');
+        is($endpoints{run_action}->({ %run }), 'UPID:fixture', 'starts a task');
+        my $rotated = $endpoints{save_secret}->({
+            %guest, revision => $saved->{revision}, name => 'deploy_key', value => "fixture-key-v2\n",
+        });
+        isnt($rotated->{revision}, $saved->{revision}, 'rotation changes the secret revision');
+        shift(@PVE::RPCEnvironment::workers)->();
+        is_deeply(\@resolved, ["fixture-key-v1\n"], 'running task retains the original value');
+        is($endpoints{run_action}->({ %run }), 'UPID:fixture', 'unchanged action config starts again');
+        shift(@PVE::RPCEnvironment::workers)->();
+        is_deeply(\@resolved, ["fixture-key-v1\n", "fixture-key-v2\n"], 'next task receives the rotated value');
+    };
+}
+
 sub capture_action {
-    my ($type, $action, $verify) = @_;
+    my ($type, $action, $verify, $secrets) = @_;
     # Keep the real STDOUT descriptor available to IPC::Open3 in the child.
     my ($output) = tempfile();
     my $previous = select($output);
-    eval { PVE::EasyActions::Runner::run_action($type, 100, $action, $verify); };
+    eval { PVE::EasyActions::Runner::run_action($type, 100, $action, $verify, $secrets); };
     my $error = $@;
     select($previous);
     seek($output, 0, 0) or die "Unable to read task log: $!";
@@ -178,7 +266,8 @@ subtest 'Fail fast and keep scripts out of host process arguments' => sub {
     is($checks, 2, 'rechecks guest identity before each step');
     is($requests[0]{path}, '/usr/bin/flock', 'runs a fixed guest executable');
     ok(!(grep { /CHECK_SCRIPT_STDIN/ } @{ $requests[0]{arg} }), 'script is absent from transport arguments');
-    is(decode_base64($requests[0]{'input-data'}), $action->{steps}[0]{command}, 'script is sent via stdin');
+    is_deeply([split(/\0/, decode_base64($requests[0]{'input-data'}), -1)],
+        ['PEA1', $action->{steps}[0]{command}, 0, 'END', ''], 'script is framed on stdin');
 
     @requests = ();
     $exit_first = 1;
@@ -186,6 +275,56 @@ subtest 'Fail fast and keep scripts out of host process arguments' => sub {
     like($error, qr/Step 1 failed with exit code 17/, 'reports a failing step and exit code');
     unlike($log, qr/Action PASS/, 'failure never records a pass');
     is(scalar(@requests), 1, 'skips the remaining steps');
+};
+
+subtest 'Snapshot secret inputs and redact exact values from QGA output' => sub {
+    my $env_value = 'deploy-token-fixture-78';
+    my $file_value = "synthetic key\nwith several lines\n";
+    my $secrets = [
+        { name => 'token', env => 'DEPLOY_TOKEN', mode => 'env', value => $env_value },
+        { name => 'key', env => 'DEPLOY_KEY', mode => 'file', value => $file_value },
+    ];
+    my @requests;
+    local $PVE::QemuServer::Monitor::mock = sub {
+        my ($vmid, $method, %arguments) = @_;
+        return {} if $method eq 'guest-ping';
+        if ($method eq 'guest-exec') {
+            push @requests, \%arguments;
+            return { pid => scalar(@requests) };
+        }
+        return { exited => 1, exitcode => 0, 'out-data' => encode_base64("before:$env_value:after\n$file_value", ''),
+            'err-data' => encode_base64('log boundary ' . substr($env_value, 0, 13), ''), 'err-truncated' => 1 };
+    };
+    my $action = { name => 'Snapshot', steps => [
+        { name => 'One', timeout => 2, command => 'first script' },
+        { name => 'Two', timeout => 2, command => 'second script' },
+    ] };
+    my $verify = sub { $secrets->[0]{value} = 'rotated elsewhere'; return { agent => 1 }; };
+    my ($log, $error) = capture_action('qemu', $action, $verify, $secrets);
+    is($error, '', 'runs both steps using the resolved snapshot');
+    is(scalar(@requests), 2, 'transport receives both steps');
+    for my $i (0 .. $#requests) {
+        my $request = $requests[$i];
+        is_deeply([split(/\0/, decode_base64($request->{'input-data'}), -1)],
+            ['PEA1', $action->{steps}[$i]{command}, 2, 'DEPLOY_TOKEN', 'env', $env_value,
+                'DEPLOY_KEY', 'file', $file_value, 'END', ''], 'snapshot values travel only in framed stdin');
+        unlike(join(' ', @{ $request->{arg} }), qr/\Q$env_value\E|\Q$file_value\E/, 'no secret value in arguments');
+    }
+    like($log, qr/before:\[secret redacted\]:after/, 'preserves non-secret stdout');
+    unlike($log, qr/deploy-token|synthetic key|with several lines/, 'removes raw values and truncated prefixes');
+    like($log, qr/log boundary \[secret redacted\]/, 'redacts a partial value at the stream truncation boundary');
+};
+
+subtest 'Reject unsafe secret values and redact overlapping truncation' => sub {
+    eval { PVE::EasyActions::Runner::encode_bindings([{ env => 'TOKEN', mode => 'env', value => "bad\0input" }]); };
+    like($@, qr/Invalid Easy Actions secret/, 'a value cannot inject framing delimiters');
+    eval { PVE::EasyActions::Runner::encode_bindings([{ env => 'TOKEN', mode => 'env', value => 'x' x (32 * 1024 + 1) }]); };
+    like($@, qr/exceed the permitted input size/, 'enforces the per-secret byte limit');
+    my $redactor = PVE::EasyActions::Runner::build_log_redactor([
+        [FIRST => 'env', 'abcdef'], [SECOND => 'file', 'defghi'],
+    ]);
+    is(PVE::EasyActions::Runner::redact_output('log abcdef', 1, $redactor), 'log [secret redacted]',
+        'redacts a whole secret crossing a partially truncated secret');
 };
 
 SKIP: {
@@ -200,6 +339,7 @@ SKIP: {
             my @guest_command = @_[9 .. $#_];
             for my $argument (@guest_command) {
                 $argument = "$directory/guest.lock" if $argument eq '/run/proxmox-easy-actions.lock';
+                $argument = $directory if $argument eq '/run';
             }
             return IPC::Open3::open3($_[0], $_[1], $_[2], @guest_command);
         };
@@ -220,6 +360,49 @@ SKIP: {
         $action->{steps}[0] = { name => 'Forced timeout', timeout => 1, command => q{trap '' TERM; exec sleep 10} };
         ($log, $error) = capture_action('lxc', $action, sub { return {}; });
         like($error, qr/Step 1 failed with exit code 137/, 'timeout kills a command that ignores TERM');
+
+        my $env_value = 'plaintext-deploy-fixture';
+        my $file_value = "synthetic SSH key\nłóżko\n\n";
+        my $secrets = [
+            { name => 'token', env => 'DEPLOY_TOKEN', mode => 'env', value => $env_value },
+            { name => 'key', env => 'DEPLOY_KEY', mode => 'file', value => $file_value },
+        ];
+        local $ENV{DEPLOY_TOKEN} = 'host-sentinel';
+        $action->{steps}[0] = { name => 'Private file', timeout => 2, command => <<'BASH' };
+test "$(stat -c %a -- "$DEPLOY_KEY")" = 600
+test "$(stat -c %a -- "${DEPLOY_KEY%/*}")" = 700
+sha256sum < "$DEPLOY_KEY"
+printf 'token=%s\n' "$DEPLOY_TOKEN"
+cat -- "$DEPLOY_KEY" >&2
+BASH
+        ($log, $error) = capture_action('lxc', $action, sub { return {}; }, $secrets);
+        is($error, '', 'env and file bindings are usable inside a guest step');
+        like($log, qr/^\[guest\] \Q@{[sha256_hex(encode_utf8($file_value))]}\E\s+-$/m,
+            'guest private file preserves the exact UTF-8 content and trailing newlines');
+        like($log, qr/token=\[secret redacted\]/, 'guest env value is injected and redacted from output');
+        unlike($log, qr/plaintext-deploy-fixture|synthetic SSH key/, 'known stdout and stderr values are redacted');
+        is($ENV{DEPLOY_TOKEN}, 'host-sentinel', 'bindings do not modify the host process environment');
+        is_deeply([glob("$directory/proxmox-easy-actions.*")], [], 'removes private files after success');
+
+        $action->{steps}[0]{command} = 'test -f "$DEPLOY_KEY" && exit 23';
+        ($log, $error) = capture_action('lxc', $action, sub { return {}; }, $secrets);
+        like($error, qr/exit code 23/, 'preserves failure status after exposing the private file');
+        is_deeply([glob("$directory/proxmox-easy-actions.*")], [], 'removes private files after failure');
+
+        $action->{steps}[0] = { name => 'Timed out', timeout => 1,
+            command => q{test -f "$DEPLOY_KEY"; trap '' TERM; exec sleep 10} };
+        ($log, $error) = capture_action('lxc', $action, sub { return {}; }, $secrets);
+        like($error, qr/exit code 137/, 'still reports the timeout when the action ignores TERM');
+        is_deeply([glob("$directory/proxmox-easy-actions.*")], [], 'removes private files after forced timeout');
+
+        my @wrapped = PVE::EasyActions::Runner::guest_command(2);
+        my $encoded = PVE::EasyActions::Runner::encode_bindings($secrets);
+        my $payload = PVE::EasyActions::Runner::step_payload('printf UNEXPECTED_SCRIPT_EXECUTION', $encoded);
+        for my $invalid (substr($payload, 0, -1), "$payload\0") {
+            my $result = PVE::EasyActions::Runner::run_container_step(100, \@wrapped, $invalid, 2);
+            is($result, 2, 'incomplete or trailing input is rejected before running a script');
+            is_deeply([glob("$directory/proxmox-easy-actions.*")], [], 'invalid input creates no secret files');
+        }
     };
 }
 

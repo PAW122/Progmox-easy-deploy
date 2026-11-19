@@ -95,7 +95,10 @@ my ($mode, $template) = @ARGV;
 my $is_install = $mode eq 'apply';
 for my $guest_type (qw(qemu lxc)) {
     my $base = "/nodes/local/easy-actions/$guest_type/100";
-    for my $endpoint (['GET', $base], ['PUT', $base], ['POST', "$base/run"]) {
+    for my $endpoint (
+        ['GET', $base], ['PUT', $base], ['POST', "$base/run"],
+        map { [$_, "$base/secrets"] } qw(GET PUT DELETE),
+    ) {
         my ($method, $path) = @$endpoint;
         my ($class, $handler) = PVE::API2->find_handler($method, $path, {});
         my $registered = $handler && $class eq 'PVE::EasyActions::API';

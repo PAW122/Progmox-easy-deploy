@@ -17,6 +17,9 @@ use constant MAX_COMMAND_BYTES => 8 * 1024;
 use constant MAX_ACTIONS => 12;
 use constant MAX_STEPS => 20;
 use constant MAX_TIMEOUT => 1800;
+use constant MAX_SECRET_BINDINGS => 8;
+use constant MAX_ACTION_SECRET_BYTES => 64 * 1024;
+use constant SECRET_NAME_PATTERN => '[A-Za-z][A-Za-z0-9_-]{0,47}';
 
 my $json = JSON::PP->new->canonical->utf8;
 
@@ -24,6 +27,31 @@ sub valid_name {
     my ($value) = @_;
     return defined($value) && !ref($value) && length($value) <= 64
         && $value =~ /\A\S(?:.*\S)?\z/ && $value !~ /[\p{Cc}\p{Cf}]/;
+}
+
+sub validate_bindings {
+    my ($bindings, $label) = @_;
+    die "$label must have a list of up to 8 secret bindings.\n"
+        if ref($bindings) ne 'ARRAY' || @$bindings > MAX_SECRET_BINDINGS;
+    my %environment;
+    my @validated;
+    my $secret_name = SECRET_NAME_PATTERN;
+    for my $binding (@$bindings) {
+        die "$label has an invalid secret binding.\n"
+            if ref($binding) ne 'HASH' || keys(%$binding) != 3;
+        my ($name, $env, $mode) = @{$binding}{qw(name env mode)};
+        die "$label has an invalid secret name.\n"
+            if !defined($name) || ref($name) || $name !~ /\A$secret_name\z/;
+        die "$label has an invalid or reserved secret environment variable.\n"
+            if !defined($env) || ref($env) || $env !~ /\A[A-Z_][A-Z0-9_]{0,63}\z/
+            || $env =~ /\A(?:BASH_|LD_|DYLD_|EASY_ACTIONS_)/
+            || $env =~ /\A(?:_|ENV|SHELLOPTS|BASHOPTS|IFS|PATH|CDPATH|UID|EUID|PPID|GROUPS|PWD|OLDPWD|GLOBIGNORE|PROMPT_COMMAND)\z/;
+        die "$label assigns the same environment variable more than once.\n" if $environment{$env}++;
+        die "$label must expose each secret as a file or environment value.\n"
+            if !defined($mode) || ref($mode) || $mode !~ /\A(?:file|env)\z/;
+        push @validated, { name => "$name", env => "$env", mode => "$mode" };
+    }
+    return \@validated;
 }
 
 sub decode_actions {
@@ -47,7 +75,8 @@ sub validate_actions {
     for my $action (@$actions) {
         my $action_label = 'Action ' . (1 + @validated);
         die "$action_label must contain a valid name of up to 64 characters and steps.\n"
-            if ref($action) ne 'HASH' || keys(%$action) != 2 || !valid_name($action->{name});
+            if ref($action) ne 'HASH' || !valid_name($action->{name})
+            || grep { $_ ne 'name' && $_ ne 'steps' && $_ ne 'secrets' } keys(%$action);
         my $name = "$action->{name}";
         die "$action_label has a duplicate or reserved name.\n" if $names{fc($name)}++;
         my $steps = $action->{steps};
@@ -72,7 +101,12 @@ sub validate_actions {
             $command =~ s/\r\n?/\n/g;
             push @validated_steps, { name => "$step->{name}", command => "$command", timeout => 0 + $timeout };
         }
-        push @validated, { name => $name, steps => \@validated_steps };
+        my $validated_action = { name => $name, steps => \@validated_steps };
+        if (exists($action->{secrets})) {
+            my $bindings = validate_bindings($action->{secrets}, $action_label);
+            $validated_action->{secrets} = $bindings if @$bindings;
+        }
+        push @validated, $validated_action;
     }
 
     return \@validated;

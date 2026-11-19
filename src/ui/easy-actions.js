@@ -3,20 +3,43 @@
 ;(function () {
     const maxActions = 12;
     const maxSteps = 20;
+    const maxSecrets = 24;
+    const maxBindings = 8;
     const maxCommandBytes = 8192;
     const maxConfigBytes = 96 * 1024;
+    const maxSecretBytes = 32 * 1024;
+    const secretNamePattern = /^[A-Za-z][A-Za-z0-9_-]{0,47}$/;
+    const envNamePattern = /^[A-Z_][A-Z0-9_]{0,63}$/;
+    const reservedEnvNames = new Set([
+        'ENV', 'SHELLOPTS', 'BASHOPTS', 'IFS', 'PATH', 'CDPATH', 'UID', 'EUID', 'PPID', 'GROUPS',
+        'PWD', 'OLDPWD', 'GLOBIGNORE', 'PROMPT_COMMAND', '_',
+    ]);
+
+    function validateBindingEnv(value) {
+        if (!envNamePattern.test(value)) {
+            return 'Use up to 64 ASCII uppercase letters, digits or underscores. Start with a letter or underscore.';
+        }
+        if (reservedEnvNames.has(value) || /^(?:BASH_|LD_|DYLD_|EASY_ACTIONS_)/.test(value)) {
+            return 'The shell or runner reserves this variable name.';
+        }
+        return true;
+    }
 
     function byteLength(value) {
         return new TextEncoder().encode(value).length;
     }
 
-    function request(url, method, data, success, failure) {
+    function request(url, method, data, success, failure, { redactError = false } = {}) {
         Proxmox.Utils.API2Request({
-            url,
+            url: method === 'DELETE' ? Ext.urlAppend(url, Ext.Object.toQueryString(data)) : url,
             method,
-            jsonData: data,
+            jsonData: method === 'DELETE' ? undefined : data,
             success: (response) => success(response.result.data),
             failure: (response) => {
+                if (redactError) {
+                    failure(response.status);
+                    return;
+                }
                 const result = response.result;
                 const message = result && (result.message || result.errors)
                     ? Proxmox.Utils.extractRequestError(result, true)
@@ -34,7 +57,7 @@
         return [...name].length <= 64 || 'Use up to 64 characters.';
     }
 
-    function editRecord(title, fields, apply) {
+    function editRecord(title, fields, apply, label = 'Apply') {
         const form = Ext.create('Ext.form.Panel', {
             border: false,
             bodyPadding: 12,
@@ -53,7 +76,7 @@
                     handler: () => dialog.close(),
                 },
                 {
-                    text: 'Apply',
+                    text: label,
                     handler: () => {
                         const editor = form.getForm();
                         if (editor.isValid()) {
@@ -91,9 +114,11 @@
                     { text: 'Add', itemId: 'add', handler: handlers.add },
                     { text: 'Edit', itemId: 'edit', disabled: true, handler: handlers.edit },
                     { text: 'Remove', itemId: 'remove', disabled: true, handler: handlers.remove },
-                    '->',
-                    { text: 'Up', itemId: 'up', disabled: true, handler: () => handlers.move(-1) },
-                    { text: 'Down', itemId: 'down', disabled: true, handler: () => handlers.move(1) },
+                    ...(handlers.move ? [
+                        '->',
+                        { text: 'Up', itemId: 'up', disabled: true, handler: () => handlers.move(-1) },
+                        { text: 'Down', itemId: 'down', disabled: true, handler: () => handlers.move(1) },
+                    ] : []),
                 ],
             },
             listeners: { itemdblclick: handlers.edit },
@@ -112,8 +137,8 @@
         grid.down('#add').setDisabled(!enabled || store.getCount() >= limit);
         grid.down('#edit').setDisabled(index < 0);
         grid.down('#remove').setDisabled(index < 0);
-        grid.down('#up').setDisabled(index < 1);
-        grid.down('#down').setDisabled(index < 0 || index >= store.getCount() - 1);
+        grid.down('#up')?.setDisabled(index < 1);
+        grid.down('#down')?.setDisabled(index < 0 || index >= store.getCount() - 1);
     }
 
     function moveRecord(grid, offset) {
@@ -127,20 +152,172 @@
         }
     }
 
+    function showSecrets(url, guestID, metadata) {
+        const store = Ext.create('Ext.data.Store', {
+            autoDestroy: true,
+            fields: ['name', 'updatedAt'],
+        });
+        let revision;
+        let busy = false;
+
+        const grid = Ext.create('Ext.grid.Panel', {
+            store,
+            border: false,
+            columns: [
+                { text: 'Name', dataIndex: 'name', flex: 1, renderer: Ext.String.htmlEncode },
+                {
+                    text: 'Last updated',
+                    dataIndex: 'updatedAt',
+                    width: 175,
+                    renderer: (value) => Ext.String.htmlEncode(Proxmox.Utils.render_timestamp(value)),
+                },
+            ],
+            tbar: [
+                { text: 'Add', itemId: 'add', handler: () => editSecret() },
+                { text: 'Rotate', itemId: 'rotate', disabled: true, handler: () => editSecret(selectedRecord(grid)) },
+                { text: 'Delete', itemId: 'delete', disabled: true, handler: removeSecret },
+                '->',
+                { text: 'Reload', handler: reload },
+            ],
+        });
+        const viewport = Ext.getBody().getViewSize();
+        const dialog = Ext.create('Ext.window.Window', {
+            title: `Secrets · Guest ${guestID}`,
+            modal: true,
+            width: Math.min(610, viewport.width - 24),
+            height: Math.min(440, viewport.height - 24),
+            layout: 'fit',
+            items: [grid],
+            listeners: { beforeclose: () => !busy },
+            buttons: [{ text: 'Close', handler: () => dialog.close() }],
+        });
+
+        function updateButtons() {
+            const record = selectedRecord(grid);
+            grid.down('#add').setDisabled(store.getCount() >= maxSecrets);
+            grid.down('#rotate').setDisabled(!record);
+            grid.down('#delete').setDisabled(!record);
+        }
+
+        function updateMetadata(data, selectedName) {
+            revision = data.revision;
+            grid.getSelectionModel().deselectAll();
+            store.loadData(data.secrets.map(({ name, updatedAt }) => ({ name, updatedAt })));
+            const row = selectedName && store.findRecord('name', selectedName, 0, false, true, true);
+            if (row) {
+                grid.getSelectionModel().select(row);
+            }
+            updateButtons();
+        }
+
+        function setBusy(state, label) {
+            busy = state;
+            dialog.setLoading(state ? label : false);
+        }
+
+        function reload() {
+            if (busy) {
+                return;
+            }
+            const selectedName = selectedRecord(grid)?.get('name');
+            setBusy(true, 'Loading secrets…');
+            request(url, 'GET', undefined, (data) => {
+                setBusy(false);
+                updateMetadata(data, selectedName);
+            }, (message) => {
+                setBusy(false);
+                Ext.Msg.alert('Could not load secrets', message);
+            });
+        }
+
+        function editSecret(record) {
+            if (busy) {
+                return;
+            }
+            const name = record?.get('name');
+            const operation = name ? 'Rotate' : 'Create';
+            const fields = name ? [] : [nameField('', (value) => {
+                if (!secretNamePattern.test(value)) {
+                    return 'Use up to 48 ASCII letters, digits, underscores or hyphens. Start with a letter.';
+                }
+                const exists = store.findRecord('name', value, 0, false, true, true);
+                return exists ? 'A secret with that name already exists. Use Rotate to replace its value.' : true;
+            })];
+            fields.push({
+                xtype: 'textareafield',
+                name: 'value',
+                fieldLabel: name ? 'New value' : 'Value',
+                height: 200,
+                allowBlank: false,
+                inputAttrTpl: 'autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false"',
+                fieldStyle: 'font-family: monospace',
+                validator: (value) => {
+                    if (!value.length || value.includes('\u0000')) {
+                        return 'Enter a value without null characters.';
+                    }
+                    return byteLength(value) <= maxSecretBytes || 'The value exceeds 32 KiB.';
+                },
+            });
+            const title = name ? `Rotate ${Ext.String.htmlEncode(name)}` : 'Create secret';
+            editRecord(title, fields, (values) => {
+                const secretName = name || values.name;
+                setBusy(true, name ? 'Rotating secret…' : 'Creating secret…');
+                request(url, 'PUT', { revision, name: secretName, value: values.value }, (data) => {
+                    setBusy(false);
+                    updateMetadata(data, secretName);
+                }, (status) => {
+                    setBusy(false);
+                    const message = Number(status) === 409
+                        ? 'The secrets list changed. Reload the list and enter the value again.'
+                        : 'Check the name, value and available secret slots, then enter the value again.';
+                    Ext.Msg.alert(`Could not ${operation.toLowerCase()} secret`, message);
+                }, { redactError: true });
+            }, operation);
+        }
+
+        function removeSecret() {
+            const name = selectedRecord(grid)?.get('name');
+            if (busy || !name) {
+                return;
+            }
+            Ext.Msg.confirm('Delete secret', `Delete ${Ext.String.htmlEncode(name)}? Remove any action bindings first.`, (answer) => {
+                if (answer === 'yes') {
+                    setBusy(true, 'Deleting secret…');
+                    request(url, 'DELETE', { revision, name }, (data) => {
+                        setBusy(false);
+                        updateMetadata(data);
+                    }, (message) => {
+                        setBusy(false);
+                        Ext.Msg.alert('Could not delete secret', message);
+                    });
+                }
+            });
+        }
+
+        grid.getSelectionModel().on('selectionchange', updateButtons);
+        updateMetadata(metadata);
+        dialog.show();
+    }
+
     function showConfig(url, guestID, config) {
         const actionStore = Ext.create('Ext.data.Store', {
             autoDestroy: true,
-            fields: ['name', 'steps'],
+            fields: ['name', 'steps', 'secrets'],
             data: config.actions,
         });
         const stepStore = Ext.create('Ext.data.Store', {
             autoDestroy: true,
             fields: ['name', 'command', 'timeout'],
         });
+        const bindingStore = Ext.create('Ext.data.Store', {
+            autoDestroy: true,
+            fields: ['name', 'env', 'mode'],
+        });
         const nameColumn = { text: 'Name', dataIndex: 'name', flex: 1, renderer: Ext.String.htmlEncode };
         let dirty = false;
         let saving = false;
         let closing = false;
+        let loadingBindings = false;
 
         function markDirty() {
             dirty = true;
@@ -227,6 +404,96 @@
             });
         }
 
+        function saveBindings() {
+            const action = selectedRecord(actions);
+            action.set('secrets', bindingStore.getRange().map((binding) => ({
+                name: binding.get('name'),
+                env: binding.get('env'),
+                mode: binding.get('mode'),
+            })));
+            updateGridButtons(bindings, maxBindings, true);
+            markDirty();
+        }
+
+        function editBinding(record) {
+            const action = selectedRecord(actions);
+            if (loadingBindings || !action) {
+                return;
+            }
+            loadingBindings = true;
+
+            request(`${url}/secrets`, 'GET', undefined, (data) => {
+                loadingBindings = false;
+                if (dialog.destroyed || saving || selectedRecord(actions) !== action
+                    || (record && !bindingStore.contains(record))) {
+                    return;
+                }
+
+                const availableNames = data.secrets.map(({ name }) => name)
+                    .filter((name) => secretNamePattern.test(name));
+                const currentName = record?.get('name');
+                if (!availableNames.length) {
+                    Ext.Msg.alert('No secrets available', 'Create a secret from the Actions menu, then add a binding.');
+                    return;
+                }
+                const missing = currentName && !availableNames.includes(currentName);
+
+                editRecord(record ? 'Edit secret binding' : 'Add secret binding', [
+                    {
+                        xtype: 'combobox',
+                        name: 'name',
+                        fieldLabel: missing ? 'Replacement secret' : 'Secret',
+                        store: availableNames,
+                        value: missing ? '' : currentName || availableNames[0],
+                        queryMode: 'local',
+                        editable: false,
+                        forceSelection: true,
+                        allowBlank: false,
+                    },
+                    {
+                        xtype: 'textfield',
+                        name: 'env',
+                        fieldLabel: 'Variable name',
+                        value: record ? record.get('env') : '',
+                        allowBlank: false,
+                        validator: (value) => {
+                            const valid = validateBindingEnv(value);
+                            if (valid !== true) {
+                                return valid;
+                            }
+                            const duplicate = bindingStore.getRange().some((binding) =>
+                                binding !== record && binding.get('env') === value,
+                            );
+                            return duplicate ? 'This action already uses that variable name.' : true;
+                        },
+                    },
+                    {
+                        xtype: 'combobox',
+                        name: 'mode',
+                        fieldLabel: 'Expose as',
+                        store: [['file', 'Temporary file path'], ['env', 'Value in environment']],
+                        value: record ? record.get('mode') : 'file',
+                        queryMode: 'local',
+                        editable: false,
+                        forceSelection: true,
+                        allowBlank: false,
+                    },
+                ], (values) => {
+                    if (record) {
+                        record.set(values);
+                    } else {
+                        bindings.getSelectionModel().select(bindingStore.add(values)[0]);
+                    }
+                    saveBindings();
+                });
+            }, (message) => {
+                loadingBindings = false;
+                if (!dialog.destroyed) {
+                    Ext.Msg.alert('Could not load secrets', message);
+                }
+            });
+        }
+
         const actions = editableGrid({ region: 'west', width: '42%', split: true }, 'Actions', actionStore, [
             nameColumn,
             { text: 'Steps', width: 66, dataIndex: 'steps', renderer: (value) => value.length },
@@ -248,7 +515,7 @@
                 markDirty();
             },
         });
-        const steps = editableGrid({ region: 'center' }, 'Steps', stepStore, [
+        const steps = editableGrid({}, 'Steps', stepStore, [
             { xtype: 'rownumberer' },
             { ...nameColumn },
             { text: 'Timeout (s)', dataIndex: 'timeout', width: 95 },
@@ -264,14 +531,32 @@
                 saveSteps();
             },
         });
+        const bindings = editableGrid({}, 'Secret bindings', bindingStore, [
+            { ...nameColumn, text: 'Secret' },
+            { text: 'Variable', dataIndex: 'env', flex: 1, renderer: Ext.String.htmlEncode },
+            { text: 'Mode', dataIndex: 'mode', width: 90, renderer: (value) => value === 'file' ? 'File path' : 'Value' },
+        ], {
+            add: () => editBinding(),
+            edit: () => editBinding(selectedRecord(bindings)),
+            remove: () => {
+                bindingStore.remove(selectedRecord(bindings));
+                saveBindings();
+            },
+        });
 
         actions.getSelectionModel().on('selectionchange', (_model, records) => {
-            stepStore.loadData(records[0] ? records[0].get('steps') : []);
+            const action = records[0];
+            stepStore.loadData(action?.get('steps') || []);
+            bindingStore.loadData(action?.get('secrets') || []);
             updateGridButtons(actions, maxActions, true);
-            updateGridButtons(steps, maxSteps, records.length > 0);
+            updateGridButtons(steps, maxSteps, !!action);
+            updateGridButtons(bindings, maxBindings, !!action);
         });
         steps.getSelectionModel().on('selectionchange', () => {
             updateGridButtons(steps, maxSteps, !!selectedRecord(actions));
+        });
+        bindings.getSelectionModel().on('selectionchange', () => {
+            updateGridButtons(bindings, maxBindings, !!selectedRecord(actions));
         });
 
         const viewport = Ext.getBody().getViewSize();
@@ -285,12 +570,12 @@
             defaults: { border: false },
             items: [
                 actions,
-                steps,
+                { xtype: 'tabpanel', region: 'center', items: [steps, bindings] },
                 {
                     xtype: 'component',
                     region: 'south',
                     padding: 10,
-                    html: 'Steps run in order as root inside the guest, each in its own Bash process.',
+                    html: 'Steps run in order as root inside the guest, each in its own Bash process. Secret bindings are available to every step of the selected action.',
                 },
             ],
             listeners: {
@@ -336,10 +621,14 @@
             if (saving || !dirty) {
                 return;
             }
-            const payload = actionStore.getRange().map((action) => ({
-                name: action.get('name'),
-                steps: action.get('steps'),
-            }));
+            const payload = actionStore.getRange().map((action) => {
+                const secrets = action.get('secrets');
+                return {
+                    name: action.get('name'),
+                    steps: action.get('steps'),
+                    ...(secrets?.length ? { secrets } : {}),
+                };
+            });
             const emptyAction = payload.find((action) => action.steps.length === 0);
             if (emptyAction) {
                 Ext.Msg.alert('Step required', `Add a step to ${Ext.String.htmlEncode(emptyAction.name)}.`);
@@ -370,6 +659,7 @@
         }
         updateGridButtons(actions, maxActions, true);
         updateGridButtons(steps, maxSteps, !!selectedRecord(actions));
+        updateGridButtons(bindings, maxBindings, !!selectedRecord(actions));
     }
 
     function attachActions(panel, type) {
@@ -383,6 +673,7 @@
         const url = `/nodes/${encodeURIComponent(guest.node)}/easy-actions/${type}/${guestID}`;
         let currentMenuRequest = 0;
         let loadingConfig = false;
+        let loadingSecrets = false;
         let starting = false;
 
         function confirmRun(name, revision) {
@@ -420,9 +711,28 @@
             });
         }
 
+        function openSecrets() {
+            if (loadingSecrets) {
+                return;
+            }
+            loadingSecrets = true;
+            const secretsUrl = `${url}/secrets`;
+            request(secretsUrl, 'GET', undefined, (metadata) => {
+                loadingSecrets = false;
+                if (!panel.destroyed) {
+                    showSecrets(secretsUrl, guestID, metadata);
+                }
+            }, (message) => {
+                loadingSecrets = false;
+                if (!panel.destroyed) {
+                    Ext.Msg.alert('Could not load secrets', message);
+                }
+            });
+        }
+
         function replaceActions(menu, items) {
-            // Keep the Config item mounted while refreshing action names and their revision.
-            menu.items.getRange().slice(1).forEach((item) => menu.remove(item, true));
+            // Keep the utility items mounted while refreshing saved actions and their revision.
+            menu.items.getRange().slice(2).forEach((item) => menu.remove(item, true));
             if (items.length) {
                 menu.add('-');
                 menu.add(items);
@@ -437,7 +747,7 @@
                     return;
                 }
                 replaceActions(menu, config.actions.map(({ name }) => ({
-                    text: Ext.String.htmlEncode(name),
+                    text: Ext.String.htmlEncode(name.toLowerCase() === 'secrets' ? `Run ${name}` : name),
                     iconCls: 'fa fa-fw fa-play',
                     handler: () => confirmRun(name, config.revision),
                 })));
@@ -455,7 +765,10 @@
             text: 'Actions',
             iconCls: 'fa fa-bolt',
             menu: {
-                items: [{ text: 'Config', iconCls: 'fa fa-fw fa-cog', handler: openConfig }],
+                items: [
+                    { text: 'Config', iconCls: 'fa fa-fw fa-cog', handler: openConfig },
+                    { text: 'Secrets', iconCls: 'fa fa-fw fa-key', handler: openSecrets },
+                ],
                 listeners: { beforeshow: loadMenu },
             },
         });
