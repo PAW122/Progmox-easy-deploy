@@ -1,0 +1,19 @@
+#!/bin/sh
+# SPDX-License-Identifier: AGPL-3.0-or-later
+set -eu
+
+case "$1" in
+    upgrade)
+        # The old processes keep running while dpkg replaces the Perl modules.
+        # The host can load the original API if package configuration is interrupted.
+        /usr/lib/proxmox-easy-actions/patch-pve detach
+        ;;
+    remove|deconfigure)
+        /usr/lib/proxmox-easy-actions/patch-pve remove
+        ;;
+    failed-upgrade)
+        # dpkg calls the new script when the old script could not detach.
+        # Keep the old package instead of replacing modules under a broken hook.
+        exit 1
+        ;;
+esac

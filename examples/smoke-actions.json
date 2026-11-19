@@ -1,0 +1,16 @@
+[
+  {
+    "name": "Smoke Pass",
+    "steps": [
+      { "name": "Guest shell", "command": "printf 'Hello from %s\\n' \"$(hostname)\"", "timeout": 10 },
+      { "name": "Health check", "command": "test -r /etc/os-release", "timeout": 10 }
+    ]
+  },
+  {
+    "name": "Smoke Fail",
+    "steps": [
+      { "name": "Intentional failure", "command": "printf 'Expected failure\\n' >&2; exit 7", "timeout": 10 },
+      { "name": "Must be skipped", "command": "printf 'Unexpected execution\\n'", "timeout": 10 }
+    ]
+  }
+]

@@ -1,0 +1,191 @@
+#!/usr/bin/perl
+# SPDX-License-Identifier: AGPL-3.0-or-later
+use strict;
+use warnings;
+
+use Digest::SHA qw(sha256_hex);
+use Errno qw(ENOENT);
+use Fcntl qw(S_IMODE S_ISREG);
+use File::Basename qw(dirname);
+use File::Path qw(make_path);
+use File::Temp qw(tempdir tempfile);
+
+my $nodes_path = '/usr/share/perl5/PVE/API2/Nodes.pm';
+my $index_path = '/usr/share/pve-manager/index.html.tpl';
+my $script_path = '/usr/share/pve-manager/js/proxmox-easy-actions.js';
+my $script_url = '/pve2/js/proxmox-easy-actions.js';
+my $perl_begin = '# BEGIN Proxmox Easy Actions';
+my $perl_end = '# END Proxmox Easy Actions';
+my $html_begin = '    <!-- BEGIN Proxmox Easy Actions -->';
+my $html_end = '    <!-- END Proxmox Easy Actions -->';
+
+sub strip_block {
+    my ($original, $begin, $end, $path) = @_;
+    my $begin_count = () = $original =~ /^\Q$begin\E$/mg;
+    my $end_count = () = $original =~ /^\Q$end\E$/mg;
+    return $original if !$begin_count && !$end_count;
+
+    if ($begin_count != 1 || $end_count != 1
+        || $original !~ s/^\Q$begin\E\n.*?^\Q$end\E\n//ms) {
+        die "Malformed Proxmox Easy Actions markers in $path\n";
+    }
+    return $original;
+}
+
+sub rewrite_nodes {
+    my ($original, $apply) = @_;
+    my $content = strip_block($original, $perl_begin, $perl_end, $nodes_path);
+    return $content if !$apply;
+
+    my $bootstrap = <<'PERL';
+require PVE::EasyActions::API;
+PVE::API2::Nodes::Nodeinfo->register_method({
+    subclass => 'PVE::EasyActions::API',
+    path => 'easy-actions',
+});
+PERL
+
+    # Use the declared Nodeinfo child so /nodes/{node}'s existing routes are preserved.
+    if ($content !~ /^package PVE::API2::Nodes::Nodeinfo;$/m
+        || $content !~ /^package PVE::API2::Nodes;$/m
+        || $content !~ s/(?=^1;[ \t]*\n?\z)/$perl_begin\n$bootstrap$perl_end\n/m) {
+        die "Unsupported Proxmox VE layout in $nodes_path\n";
+    }
+    return $content;
+}
+
+sub rewrite_index {
+    my ($original, $apply, $script_hash) = @_;
+    my $content = strip_block($original, $html_begin, $html_end, $index_path);
+    return $content if !$apply;
+
+    # The desktop startup script can immediately use entities defined in pvemanagerlib.js.
+    my $anchor = qr{^[ \t]*<script type="text/javascript" src="/pve2/js/pvemanagerlib\.js\?ver=\[% version %\]"></script>[ \t]*\n}m;
+    my $anchor_count = () = $content =~ /$anchor/g;
+    die "Unsupported Proxmox VE layout in $index_path\n" if $anchor_count != 1;
+    my $script = qq{    <script type="text/javascript" src="$script_url?v=$script_hash"></script>};
+    $content =~ s/($anchor)/$1$html_begin\n$script\n$html_end\n/;
+    return $content;
+}
+
+sub read_file {
+    my ($path) = @_;
+    open(my $file, '<:raw', $path) or die "Cannot open $path: $!\n";
+    local $/;
+    my $contents = <$file> // '';
+    close($file) or die "Cannot close $path: $!\n";
+    return $contents;
+}
+
+sub validate_candidates {
+    my ($nodes, $index, $mode) = @_;
+    my $stage = tempdir(CLEANUP => 1);
+    make_path("$stage/PVE/API2");
+    open(my $module, '>:raw', "$stage/PVE/API2/Nodes.pm") or die "Cannot stage Nodes.pm: $!\n";
+    print {$module} $nodes or die "Cannot write staged Nodes.pm: $!\n";
+    close($module) or die "Cannot close staged Nodes.pm: $!\n";
+    open(my $template, '>:raw', "$stage/index.html.tpl") or die "Cannot stage index.html.tpl: $!\n";
+    print {$template} $index or die "Cannot write staged index.html.tpl: $!\n";
+    close($template) or die "Cannot close staged index.html.tpl: $!\n";
+
+    # Load the complete installed API tree with the staged Nodes.pm first on @INC.
+    # No endpoint handlers are executed during this check.
+    my $validate = <<'PERL';
+my ($mode, $template) = @ARGV;
+my $is_install = $mode eq 'apply';
+for my $guest_type (qw(qemu lxc)) {
+    my $base = "/nodes/local/easy-actions/$guest_type/100";
+    for my $endpoint (['GET', $base], ['PUT', $base], ['POST', "$base/run"]) {
+        my ($method, $path) = @$endpoint;
+        my ($class, $handler) = PVE::API2->find_handler($method, $path, {});
+        my $registered = $handler && $class eq 'PVE::EasyActions::API';
+        die "Unexpected API registration for $method $path\n"
+            if (($registered ? 1 : 0) != ($is_install ? 1 : 0));
+    }
+}
+my $page = '';
+my $renderer = Template->new({ ABSOLUTE => 1 });
+$renderer->process($template, { theme => 'auto' }, \$page) or die $renderer->error(), "\n";
+PERL
+    system($^X, '-I', $stage, '-MPVE::API2', '-MTemplate', '-e', $validate,
+        $mode, "$stage/index.html.tpl") == 0
+        or die "Proxmox Easy Actions validation failed for $mode\n";
+}
+
+sub replace_file {
+    my ($path, $expected, $contents, $metadata) = @_;
+    my @current = lstat($path);
+    die "$path changed during Proxmox Easy Actions integration\n"
+        if !@current || !S_ISREG($current[2]) || read_file($path) ne $expected;
+
+    my ($file, $temporary) = tempfile('.proxmox-easy-actions-XXXXXXXX',
+        DIR => dirname($path), UNLINK => 1);
+    binmode($file);
+    print {$file} $contents or die "Cannot write $temporary: $!\n";
+    close($file) or die "Cannot close $temporary: $!\n";
+    chown($metadata->[4], $metadata->[5], $temporary) == 1 or die "Cannot chown $temporary: $!\n";
+    chmod(S_IMODE($metadata->[2]), $temporary) == 1 or die "Cannot chmod $temporary: $!\n";
+    rename($temporary, $path) or die "Cannot replace $path: $!\n";
+}
+
+sub reload_services {
+    return if !-d '/run/systemd/system';
+    # Same reload operation as pve-manager. Honour Debian service policy and leave
+    # deliberately inactive services inactive.
+    system('/usr/bin/deb-systemd-invoke', 'reload-or-try-restart',
+        'pvedaemon.service', 'pveproxy.service') == 0
+        or die "Could not reload Proxmox VE API services\n";
+}
+
+sub main {
+    my ($mode) = @_;
+    die "Usage: $0 apply|remove|detach\n"
+        if @_ != 1 || $mode !~ /\A(?:apply|remove|detach)\z/;
+
+    my $apply = $mode eq 'apply';
+    my $script_hash = $apply ? sha256_hex(read_file($script_path)) : '';
+    my @files;
+    for my $path ($nodes_path, $index_path) {
+        my @metadata = lstat($path);
+        if (!@metadata) {
+            next if !$apply && $! == ENOENT;
+            die "Cannot inspect $path: $!\n";
+        }
+        die "Expected a regular Proxmox VE file at $path\n" if !S_ISREG($metadata[2]);
+        my $original = read_file($path);
+        my $revised = $path eq $nodes_path
+            ? rewrite_nodes($original, $apply)
+            : rewrite_index($original, $apply, $script_hash);
+        push @files, [$path, $original, $revised, \@metadata];
+    }
+
+    my @changes = grep { $_->[1] ne $_->[2] } @files;
+    return if !$apply && !@changes;
+    if (@files == 2) {
+        validate_candidates($files[0]->[2], $files[1]->[2], $mode);
+    }
+
+    # Remove the browser link first when detaching. Install the API route first
+    # when applying. Each rename preserves the complete previous file until commit.
+    @changes = reverse @changes if !$apply;
+    my @committed;
+    eval {
+        for my $file (@changes) {
+            replace_file(@$file);
+            push @committed, $file;
+        }
+        reload_services() if $mode ne 'detach';
+        1;
+    } or do {
+        my $error = $@;
+        for my $file (reverse @committed) {
+            my ($path, $original, $revised, $metadata) = @$file;
+            eval { replace_file($path, $revised, $original, $metadata); 1 } or warn $@;
+        }
+        eval { reload_services(); 1 } or warn $@ if $mode ne 'detach' && @committed;
+        die $error;
+    };
+}
+
+main(@ARGV) unless caller;
+1;

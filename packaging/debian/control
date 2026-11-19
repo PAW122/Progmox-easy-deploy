@@ -1,0 +1,10 @@
+Package: proxmox-easy-actions
+Section: admin
+Priority: optional
+Architecture: all
+Depends: pve-manager (>= 8.4), init-system-helpers, perl
+Maintainer: Proxmox Easy Actions contributors
+Description: Configurable guest actions for Proxmox VE
+ Adds an Actions menu to the desktop UI for QEMU and LXC guests.
+ Administrators can define and run ordered commands inside each guest and view
+ their results in the Proxmox VE task viewer.

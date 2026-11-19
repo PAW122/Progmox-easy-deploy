@@ -1,0 +1,37 @@
+[
+  {
+    "name": "Deploy",
+    "steps": [
+      {
+        "name": "Fetch latest main",
+        "command": "git -C /srv/myapp/source fetch origin main\ngit -C /srv/myapp/source checkout --detach FETCH_HEAD\ngit -C /srv/myapp/source log -1 --format=%h",
+        "timeout": 120
+      },
+      {
+        "name": "Test and build candidate",
+        "command": "cd /srv/myapp/source\ngo test ./...\ninstall -d /srv/myapp/bin\ngo build -o /srv/myapp/bin/myapp.next ./cmd/myapp",
+        "timeout": 600
+      },
+      {
+        "name": "Stop old version",
+        "command": "systemctl stop myapp.service",
+        "timeout": 60
+      },
+      {
+        "name": "Run database migrations",
+        "command": "cd /srv/myapp/source\nbash ./deploy/migrate.sh",
+        "timeout": 300
+      },
+      {
+        "name": "Install and start new version",
+        "command": "mv -T /srv/myapp/bin/myapp.next /srv/myapp/bin/myapp\nsystemctl start myapp.service",
+        "timeout": 60
+      },
+      {
+        "name": "Check application health",
+        "command": "for attempt in {1..10}; do\n    if code=$(curl --silent --show-error --max-time 2 --output /dev/null --write-out '%{http_code}' http://127.0.0.1:8080/healthz) && [[ $code == 2[0-9][0-9] ]]; then\n        printf 'Application health check passed\\n'\n        exit 0\n    fi\n    sleep 2\ndone\nprintf 'Health check failed after 10 attempts\\n' >&2\nexit 1",
+        "timeout": 50
+      }
+    ]
+  }
+]
