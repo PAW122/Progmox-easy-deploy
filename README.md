@@ -6,19 +6,30 @@ Each action runs as a Proxmox VE task. You can close the task window and reopen 
 
 ## Installation
 
-The package targets Proxmox VE **8.4 and 9.x**. You can build it on Debian, Ubuntu, or directly on a Proxmox VE node. The build requires `bash` and `dpkg-deb`.
+The package targets Proxmox VE **8.4 and 9.x**. Open **Shell** on the Proxmox VE node and paste the block below as `root`. It clones the repository into a temporary directory, builds the Debian package, and installs it. If the node needs Git, run `apt install git` first.
 
 ```bash
+bash -c '
+set -e
+build_dir="$(mktemp -d)"
+git clone --depth 1 https://github.com/PAW122/Progmox-easy-deploy.git "$build_dir"
+cd "$build_dir"
 bash scripts/build-deb.sh
+apt install "./dist/proxmox-easy-actions_$(cat packaging/VERSION)_all.deb"
+'
 ```
 
-Copy the `.deb` file from `dist/` to the node. You can also use a prebuilt package from a project release when one is available. Run this command as `root` on the node.
+**Multi-node clusters.** Run the installation command on every node in the cluster and use the same package version throughout. The web interface loads the menu from the node you connect to. The node hosting the guest loads its configuration and runs its actions.
+
+Refresh the desktop web interface and sign in as `root@pam`.
+
+### Installing a local package
+
+If you have a source checkout, run `bash scripts/build-deb.sh` on Debian, Ubuntu, or Proxmox VE with `bash` and `dpkg-deb` installed. Copy the `.deb` file from `dist/` or a project release to the node. Run this command as `root` from the directory containing the package.
 
 ```bash
 apt install ./proxmox-easy-actions_0.1.0_all.deb
 ```
-
-Refresh the desktop web interface and sign in as `root@pam`. In a cluster, install the same version on every node where you want to use the add-on, including the nodes you use to access the web interface.
 
 ## Configuring and running actions
 
