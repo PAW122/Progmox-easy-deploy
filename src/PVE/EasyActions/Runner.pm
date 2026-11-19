@@ -14,6 +14,7 @@ use POSIX qw(WIFEXITED WEXITSTATUS WIFSIGNALED WTERMSIG WNOHANG);
 use Symbol qw(gensym);
 use Time::HiRes qw(clock_gettime CLOCK_MONOTONIC sleep);
 
+use PVE::EasyActions::Config ();
 use PVE::QemuServer::Monitor qw(mon_cmd);
 
 use constant LOG_LIMIT => 128 * 1024;
@@ -106,10 +107,15 @@ BASH
 
 sub guest_command {
     my ($timeout) = @_;
+    # The native worker runs under Perl -T. Values read from the saved JSON
+    # remain tainted even after numeric conversion and config validation.
+    my ($seconds) = ($timeout // '') =~ /\A([1-9][0-9]{0,3})\z/;
+    die "Invalid Easy Actions step timeout.\n"
+        if !defined($seconds) || $seconds > PVE::EasyActions::Config::MAX_TIMEOUT();
     return (
         '/usr/bin/flock', '--nonblock', '--conflict-exit-code=75', '--close',
         '/run/proxmox-easy-actions.lock',
-        '/bin/bash', '-c', $read_step, 'easy-actions', $timeout, '/run', $launch_step,
+        '/bin/bash', '-c', $read_step, 'easy-actions', $seconds, '/run', $launch_step,
     );
 }
 
@@ -220,8 +226,11 @@ sub log_output {
 
 sub run_container_step {
     my ($vmid, $command, $input, $seconds, $redactor) = @_;
+    # Capture only the canonical decimal argument before passing it to exec.
+    my ($id) = ($vmid // '') =~ /\A([1-9][0-9]{2,8})\z/;
+    die "Invalid Easy Actions guest ID.\n" if !defined($id);
     my $stdout = gensym();
-    my $pid = open3(my $stdin, $stdout, $stdout, '/usr/sbin/pct', 'exec', $vmid,
+    my $pid = open3(my $stdin, $stdout, $stdout, '/usr/sbin/pct', 'exec', $id,
         '--keep-env', '0', '--', @$command);
 
     my $deadline = clock_gettime(CLOCK_MONOTONIC) + $seconds + TRANSPORT_GRACE;

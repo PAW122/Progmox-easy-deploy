@@ -28,7 +28,7 @@ Refresh the desktop web interface and sign in as `root@pam`.
 If you have a source checkout, run `bash scripts/build-deb.sh` on Debian, Ubuntu, or Proxmox VE with `bash` and `dpkg-deb` installed. Copy the `.deb` file from `dist/` or a project release to the node. Run this command as `root` from the directory containing the package.
 
 ```bash
-apt install ./proxmox-easy-actions_0.2.0_all.deb
+apt install ./proxmox-easy-actions_0.2.1_all.deb
 ```
 
 ## Update

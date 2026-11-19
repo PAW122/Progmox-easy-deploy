@@ -299,11 +299,27 @@
         dialog.show();
     }
 
+    function copyStep({ name, command, timeout }) {
+        return { name, command, timeout };
+    }
+
+    function copyBinding({ name, env, mode }) {
+        return { name, env, mode };
+    }
+
+    function copyAction({ name, steps, secrets }) {
+        return {
+            name,
+            steps: steps.map(copyStep),
+            ...(secrets?.length ? { secrets: secrets.map(copyBinding) } : {}),
+        };
+    }
+
     function showConfig(url, guestID, config) {
         const actionStore = Ext.create('Ext.data.Store', {
             autoDestroy: true,
             fields: ['name', 'steps', 'secrets'],
-            data: config.actions,
+            data: config.actions.map(copyAction),
         });
         const stepStore = Ext.create('Ext.data.Store', {
             autoDestroy: true,
@@ -356,11 +372,7 @@
         // The selected action owns its steps. Copy the visible list back after each edit.
         function saveSteps() {
             const action = selectedRecord(actions);
-            action.set('steps', stepStore.getRange().map((step) => ({
-                name: step.get('name'),
-                command: step.get('command'),
-                timeout: step.get('timeout'),
-            })));
+            action.set('steps', stepStore.getRange().map((step) => copyStep(step.getData())));
             updateGridButtons(steps, maxSteps, true);
             markDirty();
         }
@@ -406,11 +418,7 @@
 
         function saveBindings() {
             const action = selectedRecord(actions);
-            action.set('secrets', bindingStore.getRange().map((binding) => ({
-                name: binding.get('name'),
-                env: binding.get('env'),
-                mode: binding.get('mode'),
-            })));
+            action.set('secrets', bindingStore.getRange().map((binding) => copyBinding(binding.getData())));
             updateGridButtons(bindings, maxBindings, true);
             markDirty();
         }
@@ -546,8 +554,9 @@
 
         actions.getSelectionModel().on('selectionchange', (_model, records) => {
             const action = records[0];
-            stepStore.loadData(action?.get('steps') || []);
-            bindingStore.loadData(action?.get('secrets') || []);
+            // ExtJS adds record IDs to input objects. Give each grid its own copies.
+            stepStore.loadData((action?.get('steps') || []).map(copyStep));
+            bindingStore.loadData((action?.get('secrets') || []).map(copyBinding));
             updateGridButtons(actions, maxActions, true);
             updateGridButtons(steps, maxSteps, !!action);
             updateGridButtons(bindings, maxBindings, !!action);
@@ -609,7 +618,7 @@
                 (answer) => {
                     if (answer === 'yes') {
                         actions.getSelectionModel().deselectAll();
-                        actionStore.loadData(config.previousActions);
+                        actionStore.loadData(config.previousActions.map(copyAction));
                         actions.getSelectionModel().select(0);
                         markDirty();
                     }
@@ -621,14 +630,7 @@
             if (saving || !dirty) {
                 return;
             }
-            const payload = actionStore.getRange().map((action) => {
-                const secrets = action.get('secrets');
-                return {
-                    name: action.get('name'),
-                    steps: action.get('steps'),
-                    ...(secrets?.length ? { secrets } : {}),
-                };
-            });
+            const payload = actionStore.getRange().map((action) => copyAction(action.getData()));
             const emptyAction = payload.find((action) => action.steps.length === 0);
             if (emptyAction) {
                 Ext.Msg.alert('Step required', `Add a step to ${Ext.String.htmlEncode(emptyAction.name)}.`);
