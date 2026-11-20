@@ -95,4 +95,27 @@ like($@, qr/Invalid Easy Actions step timeout/, 'out-of-range timeout is rejecte
 eval { PVE::EasyActions::Runner::guest_command('1; false'); };
 like($@, qr/Invalid Easy Actions step timeout/, 'nondecimal timeout is rejected');
 
+subtest 'Rotate the bound secret in a copied vault under Perl -T' => sub {
+    plan skip_all => 'Vault writes require Linux and CryptX'
+        if $^O ne 'linux' || !eval { require Crypt::AuthEnc::GCM; 1 };
+    require PVE::EasyActions::Secrets;
+
+    my $copy_path = "$directory/lxc-101.json";
+    my $key_directory = "$directory/keys";
+    my $actions = [{ %$action, secrets => [{ name => 'Token', env => 'DEPLOY_TOKEN', mode => 'env' }] }];
+    my $original = { Token => { value => 'initial fixture value', updatedAt => 1 } };
+    my $replacement = { Token => { value => $secret, updatedAt => 2 } };
+    PVE::EasyActions::Secrets::replace_guest_state($copy_path, $identity, $key_directory, $actions, $original, 0);
+    my $config = PVE::EasyActions::Config::read_config($copy_path, $identity, 1);
+    is($config->{vaultSlot}, 1, 'copy persisted the alternate vault slot');
+    ok(!tainted($config->{vaultSlot}), 'the validated slot can select a filesystem path');
+
+    my $vault_path = PVE::EasyActions::Secrets::guest_vault_path($copy_path, $config->{vaultSlot});
+    my $rotated = eval { PVE::EasyActions::Secrets::write_vault($vault_path, $identity, $key_directory, $replacement) };
+    is($@, '', 'rotates an existing secret with a tainted input value');
+    is_deeply(PVE::EasyActions::Secrets::read_vault($vault_path, $identity, $key_directory), $rotated,
+        'the alternate vault stores the rotated secret');
+    is_deeply(PVE::EasyActions::Config::read_config($copy_path, $identity, 1), $config, 'rotation preserves the binding');
+};
+
 done_testing();

@@ -164,6 +164,26 @@ subtest 'Validate secret bindings and preserve legacy actions' => sub {
     like($@, qr/reserved secret environment variable/, 'protects shell control variables');
 };
 
+subtest 'Validate and persist optional action groups' => sub {
+    my $fixture = tempdir(CLEANUP => 1);
+    my $config_path = "$fixture/lxc-123.json";
+    my $identity = 'a' x 64;
+    my $group = "Wdro\x{17c}enia";
+    my $action = { name => 'Build', steps => [{ name => 'Test', command => 'true', timeout => 10 }] };
+    my $actions = [$action, { %$action, name => 'Deploy', group => $group }, { %$action, name => 'Check', group => $group }];
+    my $decoded = PVE::EasyActions::Config::decode_actions(JSON::PP->new->encode($actions));
+    is_deeply($decoded, $actions, 'keeps optional Unicode group names shared by distinct actions');
+    my $saved = PVE::EasyActions::Config::write_config($fixture, $config_path, $identity, $decoded);
+    is_deeply(PVE::EasyActions::Config::read_config($config_path, $identity), $saved, 'saved groups roundtrip');
+    my $maximum = "\x{17c}" x 64;
+    is(PVE::EasyActions::Config::validate_actions([{ %$action, group => $maximum }])->[0]{group}, $maximum,
+        'the group length limit counts Unicode characters');
+    for my $invalid ('', ' padded ', "new\nline", "zero\x{200d}width", 'x' x 65, undef, []) {
+        eval { PVE::EasyActions::Config::validate_actions([{ %$action, group => $invalid }]); };
+        like($@, qr/valid group name/, 'rejects an invalid explicit group');
+    }
+};
+
 SKIP: {
     skip 'Vault API integration requires Linux and CryptX', 3
         if $^O ne 'linux' || !eval { require Crypt::AuthEnc::GCM; 1 };
@@ -202,6 +222,7 @@ SKIP: {
 
         my $action = {
             name => 'Deploy',
+            group => 'Release',
             steps => [{ name => 'Test', command => 'true', timeout => 10 }],
             secrets => [{ name => 'deploy_key', env => 'DEPLOY_KEY_FILE', mode => 'file' }],
         };
@@ -209,7 +230,7 @@ SKIP: {
         my $config = $endpoints{save_actions}->({
             %guest, revision => $current->{revision}, actions => JSON::PP->new->encode([$action]),
         });
-        is_deeply($config->{actions}, [$action], 'action config contains the binding only');
+        is_deeply($config->{actions}, [$action], 'action config preserves its group and the binding');
         eval {
             $endpoints{delete_secret}->({ %guest, revision => $saved->{revision}, name => 'deploy_key' });
         };
@@ -239,8 +260,8 @@ SKIP: {
         my $write = \&PVE::EasyActions::Secrets::write_vault;
         my $step = { name => 'Check', command => 'true', timeout => 10 };
         my $binding = { name => 'Token', env => 'DEPLOY_TOKEN', mode => 'env' };
-        my $source_action = { name => 'Deploy', steps => [$step], secrets => [$binding] };
-        my $target_action = { %$source_action, name => 'DEPLOY' };
+        my $source_action = { name => 'Deploy', group => 'Release', steps => [$step], secrets => [$binding] };
+        my $target_action = { %$source_action, name => 'DEPLOY', group => 'Checks' };
         my $source_secrets = {
             Token => { value => "source-value\n", updatedAt => 12 },
             Unbound => { value => 'unbound-value', updatedAt => 13 },
@@ -293,6 +314,8 @@ SKIP: {
         my $appended = $endpoints{get_actions}->(\%target)->{actions};
         is_deeply([map { $_->{name} } @$appended], ['DEPLOY', 'Deploy (3)', 'Deploy (2)'],
             'appends in source order, avoids case-folded conflicts and preserves incoming names when possible');
+        is_deeply([map { $_->{group} } @$appended], ['Checks', 'Release', undef],
+            'append preserves groups of existing and copied actions');
         is($appended->[0]{secrets}[0]{name}, 'Token', 'existing action keeps its binding');
         is($appended->[1]{secrets}[0]{name}, 'Token_2', 'copied action references the renamed secret');
         my $config = PVE::EasyActions::Config::read_config($target_path, $target_identity, 1);
@@ -343,11 +366,11 @@ SKIP: {
         my $step = { name => 'Check', command => 'true', timeout => 10 };
         my $binding = { name => 'Token', env => 'DEPLOY_TOKEN', mode => 'env' };
         my $file_binding = { name => 'Token', env => 'DEPLOY_TOKEN_FILE', mode => 'file' };
-        my $source_action = { name => 'Deploy', steps => [$step], secrets => [$binding, $file_binding] };
+        my $source_action = { name => 'Deploy', group => 'Release', steps => [$step], secrets => [$binding, $file_binding] };
         my $other_action = {
             name => 'Check', steps => [$step], secrets => [{ %$binding, name => 'OtherToken' }],
         };
-        my $target_action = { %$source_action, name => 'DEPLOY', secrets => [$binding] };
+        my $target_action = { %$source_action, name => 'DEPLOY', group => 'Checks', secrets => [$binding] };
         my $source_secrets = {
             Token => { value => "source-value\n", updatedAt => 12 },
             OtherToken => { value => 'other-action-value', updatedAt => 13 },
@@ -392,7 +415,7 @@ SKIP: {
             secrets => [map { { %$_, name => 'Token_2' } } @{ $source_action->{secrets} }],
         };
         is_deeply($target_config->{actions}, [$target_action, $copied_action],
-            'appends only the selected action and remaps both bindings');
+            'appends only the selected action, preserving its group and remapping both bindings');
         is_deeply(PVE::EasyActions::API::read_guest_vault($target_path, $target_identity, $target_config->{vaultSlot})->{secrets},
             { %$target_secrets, Token_2 => $source_secrets->{Token} },
             'retains the previous VM secret and excludes unrelated source secrets');

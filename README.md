@@ -28,7 +28,7 @@ Refresh the desktop web interface and sign in as `root@pam`.
 If you have a source checkout, run `bash scripts/build-deb.sh` on Debian, Ubuntu, or Proxmox VE with `bash` and `dpkg-deb` installed. Copy the `.deb` file from `dist/` or a project release to the node. Run this command as `root` from the directory containing the package.
 
 ```bash
-apt install ./proxmox-easy-actions_0.3.2_all.deb
+apt install ./proxmox-easy-actions_0.3.5_all.deb
 ```
 
 ## Update
@@ -78,6 +78,8 @@ If you already have a newer `.deb`, make the same backups and run `apt install .
 2. Add an action, such as `Deploy`, and define its steps. Each step runs in its own shell. Use absolute paths or run `cd` in the same step as the commands that need it.
 3. Save the configuration. Open **Actions**, select the action, and confirm the run.
 4. Check the log and result in the task window. If you close it, find the task by guest ID in Task History.
+
+To organize actions, edit an action in **Actions → Config** and enter or choose a **Group**, such as `common`. Actions in the group appear in a submenu that opens when you hover over its name. Clear **Group** to move the action back to the main menu.
 
 Commands run as `root` **inside the guest**. The guest needs Linux, `/bin/bash`, GNU `timeout`, `flock` from util-linux, and a writable `/run`. For VMs, enable **Options → QEMU Guest Agent** and start the `qemu-guest-agent` service inside the guest. The add-on uses `pct exec` for containers. Only `root@pam` can configure and run actions.
 

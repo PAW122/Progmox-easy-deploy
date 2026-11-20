@@ -37,7 +37,10 @@
             success: (response) => success(response.result.data),
             failure: (response) => {
                 if (redactError) {
-                    failure(response.status);
+                    // Proxmox can return an API error inside an HTTP 200 response.
+                    const status = [response.result?.status, response.status].map(Number)
+                        .find((code) => Number.isInteger(code) && code >= 400 && code < 600);
+                    failure(status);
                     return;
                 }
                 const result = response.result;
@@ -281,10 +284,15 @@
                     updateMetadata(data, secretName);
                 }, (status) => {
                     setBusy(false);
-                    const message = Number(status) === 409
-                        ? 'The secrets list changed. Reload the list and enter the value again.'
-                        : 'Check the name, value and available secret slots, then enter the value again.';
-                    Ext.Msg.alert(`Could not ${operation.toLowerCase()} secret`, message);
+                    let message = 'The request failed. Enter the value again to retry.';
+                    if (status === 400) {
+                        message = 'Check the secret name and value, then enter the value again.';
+                    } else if (status === 409) {
+                        message = 'Reload the secrets list and enter the value again.';
+                    } else if (status >= 500) {
+                        message = 'The Proxmox node could not save the secret. Check the node log.';
+                    }
+                    Ext.Msg.alert(`Could not ${operation.toLowerCase()} secret`, status ? `${message} (${status})` : message);
                 }, { redactError: true });
             }, { label: operation });
         }
@@ -498,9 +506,10 @@
         return { name, env, mode };
     }
 
-    function copyAction({ name, steps, secrets }) {
+    function copyAction({ name, group, steps, secrets }) {
         return {
             name,
+            ...(group ? { group } : {}),
             steps: steps.map(copyStep),
             ...(secrets?.length ? { secrets: secrets.map(copyBinding) } : {}),
         };
@@ -509,7 +518,7 @@
     function showConfig(url, guestID, config) {
         const actionStore = Ext.create('Ext.data.Store', {
             autoDestroy: true,
-            fields: ['name', 'steps', 'secrets'],
+            fields: ['name', 'group', 'steps', 'secrets'],
             data: config.actions.map(copyAction),
         });
         const stepStore = Ext.create('Ext.data.Store', {
@@ -568,14 +577,30 @@
                 return duplicate ? 'An action with that name already exists.' : true;
             }
 
+            const groups = [...new Set(actionStore.getRange().map((action) => action.get('group')).filter(Boolean))];
             editRecord(record ? 'Edit action' : 'Add action', [
                 nameField(record ? record.get('name') : '', validateActionName),
+                {
+                    xtype: 'combobox',
+                    name: 'group',
+                    fieldLabel: 'Group',
+                    emptyText: 'Type or choose a group',
+                    value: record?.get('group') ?? '',
+                    queryMode: 'local',
+                    displayField: 'name',
+                    valueField: 'name',
+                    forceSelection: false,
+                    store: { autoDestroy: true, fields: ['name'], data: groups.map((name) => ({ name })) },
+                    listConfig: { getInnerTpl: () => '{name:htmlEncode}' },
+                    validator: (value) => !value.trim() || validateName(value),
+                },
             ], (values) => {
                 const name = values.name.trim();
+                const group = (values.group ?? '').trim();
                 if (record) {
-                    record.set('name', name);
+                    record.set({ name, group });
                 } else {
-                    actions.getSelectionModel().select(actionStore.add({ name, steps: [] })[0]);
+                    actions.getSelectionModel().select(actionStore.add({ name, group, steps: [] })[0]);
                 }
                 markDirty();
             });
@@ -719,6 +744,7 @@
 
         const actions = editableGrid({ region: 'west', width: '42%', split: true }, 'Actions', actionStore, [
             nameColumn,
+            { ...nameColumn, text: 'Group', dataIndex: 'group', renderer: (value) => Ext.String.htmlEncode(value ?? '') },
             { text: 'Steps', width: 66, dataIndex: 'steps', renderer: (value) => value.length },
         ], {
             add: () => editAction(),
@@ -965,7 +991,12 @@
                         busy = false;
                         dialog.close();
                         const subject = action ? 'The action and its bound secrets' : 'Actions and secrets';
-                        Ext.Msg.alert('Copy complete', `${subject} were copied to ${label}.`);
+                        Ext.Msg.show({
+                            title: 'Copy complete',
+                            message: `${subject} were copied to ${label}.`,
+                            buttons: Ext.Msg.OK,
+                            icon: Ext.Msg.INFO,
+                        });
                     }, copyFailed);
                 };
                 if (action) {
@@ -1125,14 +1156,35 @@
                 if (menu.destroyed || requestID !== currentMenuRequest) {
                     return;
                 }
-                replaceActions(menu, config.actions.map(({ name }) => ({
-                    text: Ext.String.htmlEncode(
-                        name.toLowerCase() === 'secrets' || (type === 'lxc' && name.toLowerCase() === 'copy')
-                            ? `Run ${name}` : name,
-                    ),
-                    iconCls: 'fa fa-fw fa-play',
-                    handler: () => confirmRun(name, config.revision),
-                })));
+                const items = [];
+                const groups = new Map();
+                for (const { name, group } of config.actions) {
+                    const item = {
+                        text: Ext.String.htmlEncode(
+                            name.toLowerCase() === 'secrets' || (type === 'lxc' && name.toLowerCase() === 'copy')
+                                ? `Run ${name}` : name,
+                        ),
+                        iconCls: 'fa fa-fw fa-play',
+                        handler: () => confirmRun(name, config.revision),
+                    };
+                    if (!group) {
+                        items.push(item);
+                        continue;
+                    }
+
+                    if (!groups.has(group)) {
+                        const groupItem = {
+                            text: Ext.String.htmlEncode(group),
+                            iconCls: 'fa fa-fw fa-caret-right',
+                            arrowCls: `${Ext.baseCSSPrefix}hidden-display`,
+                            menu: { items: [] },
+                        };
+                        groups.set(group, groupItem.menu.items);
+                        items.push(groupItem);
+                    }
+                    groups.get(group).push(item);
+                }
+                replaceActions(menu, items);
             }, () => {
                 if (!menu.destroyed && requestID === currentMenuRequest) {
                     replaceActions(menu, [{ text: 'Could not load actions', disabled: true }]);

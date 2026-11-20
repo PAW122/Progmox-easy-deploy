@@ -86,7 +86,7 @@ sub validate_actions {
         my $action_label = 'Action ' . (1 + @validated);
         die "$action_label must contain a valid name of up to 64 characters and steps.\n"
             if ref($action) ne 'HASH' || !valid_name($action->{name})
-            || grep { $_ ne 'name' && $_ ne 'steps' && $_ ne 'secrets' } keys(%$action);
+            || grep { $_ ne 'name' && $_ ne 'steps' && $_ ne 'secrets' && $_ ne 'group' } keys(%$action);
         my $name = "$action->{name}";
         die "$action_label has a duplicate or reserved name.\n" if $names{fc($name)}++;
         my $steps = $action->{steps};
@@ -112,6 +112,11 @@ sub validate_actions {
             push @validated_steps, { name => "$step->{name}", command => "$command", timeout => 0 + $timeout };
         }
         my $validated_action = { name => $name, steps => \@validated_steps };
+        if (exists($action->{group})) {
+            die "$action_label must contain a valid group name of up to 64 characters.\n"
+                if !valid_name($action->{group});
+            $validated_action->{group} = "$action->{group}";
+        }
         if (exists($action->{secrets})) {
             my $bindings = validate_bindings($action->{secrets}, $action_label);
             $validated_action->{secrets} = $bindings if @$bindings;
@@ -146,6 +151,7 @@ sub try_lock {
 sub read_config {
     my ($path, $identity, $include_vault_slot) = @_;
     my ($raw, $saved);
+    my $vault_slot = 0;
     if (open(my $fh, '<:raw', $path)) {
         $raw = '';
         while (!eof($fh)) {
@@ -160,8 +166,10 @@ sub read_config {
         die "Saved Easy Actions config is invalid.\n"
             if $@ || ref($saved) ne 'HASH' || ($saved->{version} // 0) ne '1'
             || ($saved->{identity} // '') !~ /\A[0-9a-f]{64}\z/;
-        die "Saved Easy Actions vault slot is invalid.\n"
-            if exists($saved->{vaultSlot}) && !valid_vault_slot($saved->{vaultSlot});
+        if (exists($saved->{vaultSlot})) {
+            $vault_slot = parse_vault_slot($saved->{vaultSlot});
+            die "Saved Easy Actions vault slot is invalid.\n" if !defined($vault_slot);
+        }
         $saved->{actions} = validate_actions($saved->{actions});
     } elsif ($! != ENOENT) {
         die "Unable to open Easy Actions config: $!\n";
@@ -169,7 +177,7 @@ sub read_config {
 
     # Include the guest identity even before the first save and after a guest is replaced.
     my $config = { revision => sha256_hex($identity . "\n" . ($raw // '')), actions => [] };
-    $config->{vaultSlot} = $saved ? $saved->{vaultSlot} // 0 : 0 if $include_vault_slot;
+    $config->{vaultSlot} = $vault_slot if $include_vault_slot;
     return $config if !$saved;
     if ($saved->{identity} eq $identity) {
         $config->{actions} = $saved->{actions};
@@ -179,15 +187,18 @@ sub read_config {
     return $config;
 }
 
-sub valid_vault_slot {
+sub parse_vault_slot {
     my ($slot) = @_;
-    return defined($slot) && !ref($slot) && $slot =~ /\A[01]\z/;
+    return undef if !defined($slot) || ref($slot);
+    # A slot read from JSON selects a filesystem path under Perl -T.
+    my ($validated) = $slot =~ /\A([01])\z/;
+    return defined($validated) ? 0 + $validated : undef;
 }
 
 sub prepare_config {
     my ($directory, $identity, $actions, $slot) = @_;
-    $slot //= 0;
-    die "Invalid Easy Actions vault slot.\n" if !valid_vault_slot($slot);
+    $slot = parse_vault_slot($slot // 0);
+    die "Invalid Easy Actions vault slot.\n" if !defined($slot);
     validate_config_size($actions);
     my $saved = { version => 1, identity => $identity, actions => $actions };
     $saved->{vaultSlot} = 1 if $slot;
