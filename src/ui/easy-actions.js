@@ -57,17 +57,24 @@
         return [...name].length <= 64 || 'Use up to 64 characters.';
     }
 
-    function editRecord(title, fields, apply, label = 'Apply') {
+    function editRecord(title, fields, apply, { label = 'Apply', height } = {}) {
+        const viewport = Ext.getBody().getViewSize();
         const form = Ext.create('Ext.form.Panel', {
             border: false,
             bodyPadding: 12,
-            defaults: { anchor: '100%', labelWidth: 120 },
+            layout: height ? { type: 'vbox', align: 'stretch' } : 'anchor',
+            scrollable: height ? 'y' : undefined,
+            defaults: height ? { labelWidth: 120 } : { anchor: '100%', labelWidth: 120 },
             items: fields,
         });
         const dialog = Ext.create('Ext.window.Window', {
             title,
             modal: true,
-            width: Math.min(590, Ext.getBody().getViewSize().width - 24),
+            width: Math.min(590, viewport.width - 24),
+            ...(height ? {
+                height: Math.min(height, viewport.height - 24),
+                minHeight: Math.min(300, viewport.height - 24),
+            } : {}),
             layout: 'fit',
             items: [form],
             buttons: [
@@ -114,6 +121,13 @@
                     { text: 'Add', itemId: 'add', handler: handlers.add },
                     { text: 'Edit', itemId: 'edit', disabled: true, handler: handlers.edit },
                     { text: 'Remove', itemId: 'remove', disabled: true, handler: handlers.remove },
+                    ...(handlers.copy ? [{
+                        text: 'Copy',
+                        itemId: 'copy',
+                        disabled: true,
+                        tooltip: 'Copy the selected action and its bound secrets. Save edits to the action first.',
+                        handler: handlers.copy,
+                    }] : []),
                     ...(handlers.move ? [
                         '->',
                         { text: 'Up', itemId: 'up', disabled: true, handler: () => handlers.move(-1) },
@@ -272,7 +286,7 @@
                         : 'Check the name, value and available secret slots, then enter the value again.';
                     Ext.Msg.alert(`Could not ${operation.toLowerCase()} secret`, message);
                 }, { redactError: true });
-            }, operation);
+            }, { label: operation });
         }
 
         function removeSecret() {
@@ -301,6 +315,183 @@
 
     function copyStep({ name, command, timeout }) {
         return { name, command, timeout };
+    }
+
+    const bashKeywords = new Set([
+        'if', 'then', 'elif', 'else', 'fi', 'case', 'esac', 'for', 'select', 'while', 'until',
+        'in', 'do', 'done', 'function', 'time', 'coproc',
+    ]);
+    const bashBuiltins = new Set([
+        'alias', 'break', 'cd', 'command', 'continue', 'declare', 'echo', 'eval', 'exec', 'exit',
+        'export', 'false', 'getopts', 'local', 'mapfile', 'printf', 'pwd', 'read', 'readonly', 'return',
+        'set', 'shift', 'shopt', 'source', 'test', 'trap', 'true', 'type', 'ulimit', 'umask', 'unset', 'wait',
+    ]);
+    const bashEscape = /\\[\s\S]/.source;
+    const bashVariable = /\$(?:\{[^}\n]*\}|[a-zA-Z_]\w*|[0-9?#$!*@-])/.source;
+    const bashWordStart = /(?<![^ \t\n;|&()<>])/.source;
+    const bashTokens = new RegExp([
+        bashEscape,
+        `${bashWordStart}(?<comment>#[^\\n]*)`,
+        /(?<literal>\$'(?:\\[\s\S]|[^'\\])*'?|'[^']*'?)/.source,
+        /(?<string>\$?"(?:\\[\s\S]|[^"\\])*"?)/.source,
+        `(?<variable>${bashVariable})`,
+        `${bashWordStart}${/(?<word>[a-zA-Z_]\w*)(?=$|[ \t\n;|&()<>=])/.source}`,
+        /(?<operator>\[\[|\]\]|[|&;<>!(){}])/.source,
+        /(?<number>(?<![\w.-])\d+(?![\w.-]))/.source,
+    ].join('|'), 'g');
+    const bashInterpolations = new RegExp(`${bashEscape}|(?<variable>${bashVariable})`, 'g');
+
+    function highlightBash(context, source, colors) {
+        function append(text, color) {
+            if (!text) {
+                return;
+            }
+            if (!color) {
+                context.append(text);
+                return;
+            }
+            const span = context.ownerDocument.createElement('span');
+            span.style.color = color;
+            span.textContent = text;
+            context.append(span);
+        }
+
+        function appendString(value) {
+            let offset = 0;
+            for (const match of value.matchAll(bashInterpolations)) {
+                if (match.groups.variable) {
+                    append(value.slice(offset, match.index), colors.string);
+                    append(match[0], colors.variable);
+                    offset = match.index + match[0].length;
+                }
+            }
+            append(value.slice(offset), colors.string);
+        }
+
+        let offset = 0;
+        for (const match of source.matchAll(bashTokens)) {
+            append(source.slice(offset, match.index));
+            const kind = Object.keys(match.groups).find((name) => match.groups[name] !== undefined);
+            if (kind === 'string') {
+                appendString(match[0]);
+            } else if (kind === 'word') {
+                const word = match[0];
+                const color = bashKeywords.has(word) ? colors.keyword : bashBuiltins.has(word) ? colors.builtin : '';
+                append(word, color);
+            } else {
+                append(match[0], colors[kind === 'literal' ? 'string' : kind]);
+            }
+            offset = match.index + match[0].length;
+        }
+        append(source.slice(offset));
+    }
+
+    function attachBashHighlight(field) {
+        if (window.matchMedia('(forced-colors: active)').matches) {
+            return;
+        }
+        const input = field.inputEl.dom;
+        const wrapper = input.parentElement;
+        const inputStyle = window.getComputedStyle(input);
+        const foreground = inputStyle.color;
+        const [red, green, blue] = foreground.match(/[\d.]+/g)?.map(Number) ?? [];
+        const colors = red * 0.2126 + green * 0.7152 + blue * 0.0722 > 128 ? {
+            comment: '#a1afc0', string: '#91dda9', variable: '#a5d4fe', keyword: '#d4afff',
+            builtin: '#80d8e7', operator: '#ffb387', number: '#f0ce8c',
+        } : {
+            comment: '#57606a', string: '#116329', variable: '#0550ae', keyword: '#6639ba',
+            builtin: '#0b5c75', operator: '#953800', number: '#795104',
+        };
+
+        // Mirror the native textarea so editing, form validation and keyboard shortcuts stay native.
+        const overlay = input.ownerDocument.createElement('pre');
+        overlay.setAttribute('aria-hidden', 'true');
+        Object.assign(overlay.style, {
+            boxSizing: 'border-box',
+            position: 'absolute',
+            margin: '0',
+            border: '0',
+            background: 'transparent',
+            overflow: 'hidden',
+            pointerEvents: 'none',
+            zIndex: '1',
+            color: foreground,
+            fontFamily: inputStyle.fontFamily,
+            fontSize: inputStyle.fontSize,
+            fontStyle: inputStyle.fontStyle,
+            fontWeight: inputStyle.fontWeight,
+            fontVariantLigatures: inputStyle.fontVariantLigatures,
+            lineHeight: inputStyle.lineHeight,
+            direction: inputStyle.direction,
+            textAlign: inputStyle.textAlign,
+            letterSpacing: inputStyle.letterSpacing,
+            wordSpacing: inputStyle.wordSpacing,
+            whiteSpace: inputStyle.whiteSpace,
+            overflowWrap: inputStyle.overflowWrap,
+            tabSize: inputStyle.tabSize,
+            padding: inputStyle.padding,
+        });
+        if (window.getComputedStyle(wrapper).position === 'static') {
+            wrapper.style.position = 'relative';
+        }
+        wrapper.append(overlay);
+        input.style.caretColor = foreground;
+        const nativeColor = input.style.color;
+
+        function syncScroll() {
+            overlay.scrollTop = input.scrollTop;
+            overlay.scrollLeft = input.scrollLeft;
+        }
+
+        function syncLayout() {
+            const inputRect = input.getBoundingClientRect();
+            const wrapperRect = wrapper.getBoundingClientRect();
+            Object.assign(overlay.style, {
+                top: `${inputRect.top - wrapperRect.top - wrapper.clientTop + input.clientTop}px`,
+                left: `${inputRect.left - wrapperRect.left - wrapper.clientLeft + input.clientLeft}px`,
+                width: `${input.clientWidth}px`,
+                height: `${input.clientHeight}px`,
+            });
+            syncScroll();
+        }
+
+        let composing = false;
+        let highlighted;
+        function render() {
+            const source = input.value;
+            const enabled = !composing && source.length <= maxCommandBytes;
+            overlay.hidden = !enabled;
+            input.style.color = enabled ? 'transparent' : nativeColor;
+            if (!enabled) {
+                return;
+            }
+            if (source !== highlighted) {
+                const content = input.ownerDocument.createDocumentFragment();
+                highlightBash(content, source, colors);
+                if (source.endsWith('\n')) {
+                    content.append('\u200b');
+                }
+                overlay.replaceChildren(content);
+                highlighted = source;
+            }
+            syncLayout();
+        }
+
+        const resize = new ResizeObserver(syncLayout);
+        resize.observe(input);
+        field.on('beforedestroy', () => resize.disconnect());
+        field.on('change', render);
+        input.addEventListener('input', render);
+        input.addEventListener('scroll', syncScroll);
+        input.addEventListener('compositionstart', () => {
+            composing = true;
+            render();
+        });
+        input.addEventListener('compositionend', () => {
+            composing = false;
+            render();
+        });
+        render();
     }
 
     function copyBinding({ name, env, mode }) {
@@ -334,10 +525,31 @@
         let saving = false;
         let closing = false;
         let loadingBindings = false;
+        let actionCopyDialog;
+        const savedActions = new Map(actionStore.getRange().map((record) => [
+            record, JSON.stringify(copyAction(record.getData())),
+        ]));
+
+        function isSavedAction(record) {
+            return record && savedActions.get(record) === JSON.stringify(copyAction(record.getData()));
+        }
+
+        function updateCopyButton() {
+            actions.down('#copy').setDisabled(saving || !isSavedAction(selectedRecord(actions)));
+        }
+
+        function copySelectedAction() {
+            const record = selectedRecord(actions);
+            if (saving || !isSavedAction(record) || (actionCopyDialog && !actionCopyDialog.destroyed)) {
+                return;
+            }
+            actionCopyDialog = showCopy(url, guestID, { name: record.get('name'), sourceRevision: config.revision });
+        }
 
         function markDirty() {
             dirty = true;
             dialog.down('#save-actions').setDisabled(false);
+            updateCopyButton();
         }
 
         function editAction(record) {
@@ -395,9 +607,12 @@
                     name: 'command',
                     fieldLabel: 'Bash command',
                     value: record ? record.get('command') : '',
-                    height: 200,
-                    fieldStyle: 'font-family: monospace',
+                    flex: 1,
+                    minHeight: 96,
+                    fieldStyle: 'font-family: monospace; font-variant-ligatures: none; line-height: 1.5; tab-size: 4',
+                    inputAttrTpl: 'autocapitalize="off" autocorrect="off" spellcheck="false"',
                     allowBlank: false,
+                    listeners: { afterrender: attachBashHighlight },
                     validator: (value) => {
                         if (!value.trim().length || value.includes('\u0000')) {
                             return 'Enter a Bash command without null characters.';
@@ -413,7 +628,7 @@
                     steps.getSelectionModel().select(stepStore.add(values)[0]);
                 }
                 saveSteps();
-            });
+            }, { height: 420 });
         }
 
         function saveBindings() {
@@ -508,6 +723,7 @@
         ], {
             add: () => editAction(),
             edit: () => editAction(selectedRecord(actions)),
+            copy: copySelectedAction,
             remove: () => {
                 const action = selectedRecord(actions);
                 Ext.Msg.confirm('Remove action', `Remove ${Ext.String.htmlEncode(action.get('name'))} and its steps?`, (answer) => {
@@ -558,6 +774,7 @@
             stepStore.loadData((action?.get('steps') || []).map(copyStep));
             bindingStore.loadData((action?.get('secrets') || []).map(copyBinding));
             updateGridButtons(actions, maxActions, true);
+            updateCopyButton();
             updateGridButtons(steps, maxSteps, !!action);
             updateGridButtons(bindings, maxBindings, !!action);
         });
@@ -573,8 +790,8 @@
         const dialog = Ext.create('Ext.window.Window', {
             title: `Actions · Config · Guest ${guestID}`,
             modal: true,
-            width: Math.min(840, viewport.width - 24),
-            height: Math.min(490, viewport.height - 24),
+            width: Math.min(960, viewport.width - 24),
+            height: Math.min(560, viewport.height - 24),
             layout: 'border',
             defaults: { border: false },
             items: [
@@ -643,6 +860,7 @@
             }
 
             saving = true;
+            updateCopyButton();
             dialog.setLoading('Saving actions…');
             request(url, 'PUT', { revision: config.revision, actions: json }, () => {
                 saving = false;
@@ -650,6 +868,7 @@
                 dialog.close();
             }, (message) => {
                 saving = false;
+                updateCopyButton();
                 dialog.setLoading(false);
                 Ext.Msg.alert('Could not save actions', message);
             });
@@ -660,8 +879,148 @@
             actions.getSelectionModel().select(0);
         }
         updateGridButtons(actions, maxActions, true);
+        updateCopyButton();
         updateGridButtons(steps, maxSteps, !!selectedRecord(actions));
         updateGridButtons(bindings, maxBindings, !!selectedRecord(actions));
+    }
+
+    function showCopy(url, guestID, action) {
+        const targetKind = action ? 'guest' : 'container';
+        const store = Ext.create('Ext.data.Store', {
+            autoDestroy: true,
+            fields: [{ name: 'vmid', type: 'int' }, 'node', 'type', 'label'],
+            sorters: ['vmid'],
+        });
+        const target = Ext.create('Ext.form.field.ComboBox', {
+            itemId: 'copy-target',
+            fieldLabel: action ? 'Target VM or CT' : 'Target container',
+            labelWidth: 120,
+            anchor: '100%',
+            emptyText: 'Search by VMID, name or node',
+            store,
+            queryMode: 'local',
+            anyMatch: true,
+            forceSelection: true,
+            allowBlank: false,
+            valueField: 'vmid',
+            displayField: 'label',
+            listConfig: {
+                emptyText: `No matching ${targetKind}s`,
+                getInnerTpl: () => '{label:htmlEncode}',
+            },
+        });
+        let busy = true;
+        const dialog = Ext.create('Ext.window.Window', {
+            title: action ? `Copy action · ${Ext.String.htmlEncode(action.name)}` : `Copy actions and secrets · CT ${guestID}`,
+            modal: true,
+            defaultFocus: '#copy-target',
+            width: Math.min(580, Ext.getBody().getViewSize().width - 24),
+            layout: 'fit',
+            items: [{
+                xtype: 'form',
+                border: false,
+                bodyPadding: 12,
+                items: [
+                    target,
+                    ...(action ? [{
+                        xtype: 'component',
+                        margin: '8 0 0',
+                        html: 'Adds the selected action and its bound secrets. Matching names get a suffix.',
+                    }] : []),
+                ],
+                buttons: [
+                    { text: 'Cancel', handler: () => dialog.close() },
+                    { text: 'Copy', formBind: true, disabled: true, handler: checkTarget },
+                ],
+            }],
+            listeners: { beforeclose: () => !busy },
+        });
+
+        function copyFailed(message) {
+            busy = false;
+            dialog.setLoading(false);
+            Ext.Msg.alert(action ? 'Could not copy action' : 'Could not copy actions and secrets', message);
+        }
+
+        function checkTarget() {
+            const record = target.findRecordByValue(target.getValue());
+            if (busy || !record) {
+                return;
+            }
+            const targetVmid = record.get('vmid');
+            const targetNode = record.get('node');
+            const targetType = record.get('type');
+            const label = Ext.String.htmlEncode(record.get('label'));
+            const targetUrl = `/nodes/${encodeURIComponent(targetNode)}/easy-actions/${targetType}/${targetVmid}/copy`;
+            busy = true;
+            dialog.setLoading(`Checking the target ${targetKind}…`);
+
+            request(targetUrl, 'GET', undefined, (state) => {
+                const copy = (mode) => {
+                    const destination = { targetNode, targetVmid, revision: state.revision };
+                    const route = action ? 'copy-action' : 'copy';
+                    const params = action ? { ...action, ...destination, targetType } : { ...destination, mode };
+                    dialog.setLoading(action ? 'Copying action and bound secrets…' : 'Copying actions and secrets…');
+                    request(`${url}/${route}`, 'POST', params, () => {
+                        busy = false;
+                        dialog.close();
+                        const subject = action ? 'The action and its bound secrets' : 'Actions and secrets';
+                        Ext.Msg.alert('Copy complete', `${subject} were copied to ${label}.`);
+                    }, copyFailed);
+                };
+                if (action) {
+                    copy();
+                    return;
+                }
+                if (!Number(state.occupied)) {
+                    copy('empty');
+                    return;
+                }
+
+                dialog.setLoading(false);
+                Ext.Msg.show({
+                    title: 'Target already has a configuration',
+                    message: `${label} already has saved actions or secrets.<br><br>`
+                        + '<b>Append</b> adds the copied actions after the existing actions and keeps existing secrets. '
+                        + 'Matching names are renamed in the copied configuration.<br><br>'
+                        + '<b>Overwrite</b> replaces all target actions and secrets.',
+                    buttons: Ext.Msg.YESNOCANCEL,
+                    buttonText: { yes: 'Append', no: 'Overwrite', cancel: 'Cancel' },
+                    defaultFocus: '#cancel',
+                    fn: (answer) => {
+                        if (answer === 'yes' || answer === 'no') {
+                            copy(answer === 'yes' ? 'append' : 'overwrite');
+                        } else {
+                            busy = false;
+                        }
+                    },
+                });
+            }, copyFailed);
+        }
+
+        dialog.show();
+        dialog.setLoading(`Loading ${targetKind}s…`);
+        request('/cluster/resources?type=vm', 'GET', undefined, (resources) => {
+            const targets = resources.filter(({ type, vmid, node, template }) =>
+                (type === 'lxc' || (action && type === 'qemu'))
+                && node && Number(vmid) !== Number(guestID) && !Number(template),
+            ).map(({ type, vmid, name, node }) => ({
+                type, vmid, node, label: `${type === 'lxc' ? 'CT' : 'VM'} ${vmid}${name ? ` (${name})` : ''} · ${node}`,
+            }));
+            busy = false;
+            dialog.setLoading(false);
+            if (targets.length) {
+                store.loadData(targets);
+            } else {
+                dialog.close();
+                Ext.Msg.alert(`No target ${targetKind}`, `No other ${targetKind}s are available.`);
+            }
+        }, (message) => {
+            busy = false;
+            dialog.close();
+            Ext.Msg.alert(`Could not load ${targetKind}s`, message);
+        });
+        return dialog;
     }
 
     function attachActions(panel, type) {
@@ -676,6 +1035,7 @@
         let currentMenuRequest = 0;
         let loadingConfig = false;
         let loadingSecrets = false;
+        let copyDialog;
         let starting = false;
 
         function confirmRun(name, revision) {
@@ -732,9 +1092,26 @@
             });
         }
 
+        const utilityItems = [
+            { text: 'Config', iconCls: 'fa fa-fw fa-cog', handler: openConfig },
+            { text: 'Secrets', iconCls: 'fa fa-fw fa-key', handler: openSecrets },
+        ];
+        if (type === 'lxc') {
+            utilityItems.push({
+                text: 'Copy',
+                iconCls: 'fa fa-fw fa-copy',
+                handler: () => {
+                    if (!copyDialog || copyDialog.destroyed) {
+                        copyDialog = showCopy(url, guestID);
+                    }
+                },
+            });
+        }
+        const utilityItemCount = utilityItems.length;
+
         function replaceActions(menu, items) {
             // Keep the utility items mounted while refreshing saved actions and their revision.
-            menu.items.getRange().slice(2).forEach((item) => menu.remove(item, true));
+            menu.items.getRange().slice(utilityItemCount).forEach((item) => menu.remove(item, true));
             if (items.length) {
                 menu.add('-');
                 menu.add(items);
@@ -749,7 +1126,10 @@
                     return;
                 }
                 replaceActions(menu, config.actions.map(({ name }) => ({
-                    text: Ext.String.htmlEncode(name.toLowerCase() === 'secrets' ? `Run ${name}` : name),
+                    text: Ext.String.htmlEncode(
+                        name.toLowerCase() === 'secrets' || (type === 'lxc' && name.toLowerCase() === 'copy')
+                            ? `Run ${name}` : name,
+                    ),
                     iconCls: 'fa fa-fw fa-play',
                     handler: () => confirmRun(name, config.revision),
                 })));
@@ -767,10 +1147,7 @@
             text: 'Actions',
             iconCls: 'fa fa-bolt',
             menu: {
-                items: [
-                    { text: 'Config', iconCls: 'fa fa-fw fa-cog', handler: openConfig },
-                    { text: 'Secrets', iconCls: 'fa fa-fw fa-key', handler: openSecrets },
-                ],
+                items: utilityItems,
                 listeners: { beforeshow: loadMenu },
             },
         });

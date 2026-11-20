@@ -171,7 +171,7 @@ sub master_key {
     if (!defined($key) && $allow_create) {
         opendir(my $entries, $vault_directory) or die "Unable to open Easy Actions vault directory: $!\n";
         local $! = 0;
-        my $has_vault = grep { /\A(?:lxc|qemu)-[0-9]+\.json\.secrets\z/ } readdir($entries);
+        my $has_vault = grep { /\A(?:lxc|qemu)-[0-9]+\.json(?:\.copy)?\.secrets\z/ } readdir($entries);
         die "Unable to list Easy Actions vaults: $!\n" if $!;
         closedir($entries) or die "Unable to close Easy Actions vault directory: $!\n";
         if (!$has_vault) {
@@ -263,6 +263,40 @@ sub write_vault {
     rename($temporary->filename, $path) or die "Unable to save Easy Actions secret vault: $!\n";
     sync_directory($directory);
     return vault_state($context, $raw, $secrets);
+}
+
+sub guest_vault_path {
+    my ($path, $slot) = @_;
+    return $slot ? "$path.copy.secrets" : "$path.secrets";
+}
+
+sub replace_guest_state {
+    my ($path, $identity, $key_directory, $actions, $secrets, $current_slot) = @_;
+    my $directory = dirname($path);
+    assert_private_directory($directory);
+    my $next_slot = $current_slot ? 0 : 1;
+    my $next_path = guest_vault_path($path, $next_slot);
+    my ($temporary, $config) = PVE::EasyActions::Config::prepare_config($directory, $identity, $actions, $next_slot);
+
+    # Callers hold the guest save lock. The config rename makes the staged
+    # vault visible together with its actions, including after a process crash.
+    if (keys %$secrets) {
+        write_vault($next_path, $identity, $key_directory, $secrets);
+    } else {
+        unlink($next_path) || $! == ENOENT or die "Unable to stage an empty Easy Actions vault: $!\n";
+        sync_directory($directory);
+    }
+    PVE::EasyActions::Config::publish_config($temporary, $path);
+    sync_directory($directory);
+
+    # Keep the retired slot until the new config is durable.
+    my $retired_path = guest_vault_path($path, $current_slot);
+    if (unlink($retired_path)) {
+        eval { sync_directory($directory); 1 } or warn $@;
+    } elsif ($! != ENOENT) {
+        warn "Unable to remove the retired Easy Actions vault: $!\n";
+    }
+    return $config;
 }
 
 1;

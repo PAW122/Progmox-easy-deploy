@@ -30,6 +30,7 @@ install -m 0644 "$repository/packaging/debian/triggers" "$package/DEBIAN/trigger
 install -m 0755 "$repository/packaging/debian/postinst" "$repository/packaging/debian/prerm" \
     "$package/DEBIAN/"
 install -m 0755 "$repository/packaging/patch-pve" "$package/usr/lib/proxmox-easy-actions/patch-pve"
+install -m 0755 "$repository/packaging/receive-copy" "$package/usr/lib/proxmox-easy-actions/receive-copy"
 install -m 0644 "$repository/src/PVE/EasyActions/"*.pm "$perl_modules/"
 install -m 0644 "$repository/src/ui/easy-actions.js" \
     "$package/usr/share/pve-manager/js/proxmox-easy-actions.js"

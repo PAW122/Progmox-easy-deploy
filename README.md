@@ -1,6 +1,6 @@
 # Proxmox Easy Actions
 
-Proxmox Easy Actions adds an **Actions** menu to the toolbar of each VM and LXC container in Proxmox VE. Each guest has its own list of actions. The first menu item, **Config**, opens an editor for action names, step order, Bash commands, and timeouts.
+Proxmox Easy Actions adds an **Actions** menu to the toolbar of each VM and LXC container in Proxmox VE. Each guest has its own list of actions. The first menu item, **Config**, opens an editor for action names, step order, Bash commands, and timeouts. The step editor highlights Bash syntax as you type.
 
 Each action runs as a Proxmox VE task. You can close the task window and reopen the log from Task History. If a step fails or times out, the task stops and identifies the failed step.
 
@@ -28,7 +28,7 @@ Refresh the desktop web interface and sign in as `root@pam`.
 If you have a source checkout, run `bash scripts/build-deb.sh` on Debian, Ubuntu, or Proxmox VE with `bash` and `dpkg-deb` installed. Copy the `.deb` file from `dist/` or a project release to the node. Run this command as `root` from the directory containing the package.
 
 ```bash
-apt install ./proxmox-easy-actions_0.2.1_all.deb
+apt install ./proxmox-easy-actions_0.3.2_all.deb
 ```
 
 ## Update
@@ -83,6 +83,17 @@ Commands run as `root` **inside the guest**. The guest needs Linux, `/bin/bash`,
 
 - Verify command execution, task results, and whether later steps are skipped after a failure with [Smoke Pass and Smoke Fail](examples/smoke-actions.json).
 - The Go deployment example fetches the latest commit from `main`, tests and builds the candidate, stops the service, runs migrations, replaces the binary, starts the service, and checks `/healthz`. [Go deployment action](examples/go-deploy.json) · [Customization and import guide](examples/README.md)
+
+## Copying actions and secrets
+
+On the source container, open **Actions → Copy** and select another LXC container. The copy uses the source's saved actions and all its saved secrets. If the target has any actions or secrets, choose one of these options.
+
+- **Append** keeps the target configuration and adds the source actions after the existing ones. When a name already exists, the copied action gets a suffix like ` (2)` and the copied secret gets a suffix like `_2`. Copied actions use the renamed secrets automatically.
+- **Overwrite** replaces all actions and secrets on the target with the source configuration.
+
+For a target on another node, install the same version of the add-on on both nodes. The copy uses the cluster's trusted SSH connection and the destination node encrypts the secrets with its own key.
+
+To copy one action, open **Actions → Config**, select a saved action, and click **Copy**. Choose another VM or LXC container. The copy is added to the destination with the secrets bound to that action. Existing actions and secrets are kept, and duplicate names receive the same suffixes as **Append**.
 
 ## Secrets
 

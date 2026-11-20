@@ -60,9 +60,19 @@ sub decode_actions {
     die "Actions JSON exceeds 96 KiB.\n" if length($bytes) > MAX_CONFIG_BYTES;
     my $value = eval { $json->decode($bytes) };
     die "Actions must be a valid JSON array.\n" if $@;
-    my $actions = validate_actions($value);
+    return validate_sized_actions($value);
+}
+
+sub validate_config_size {
+    my ($actions) = @_;
     die "Actions JSON exceeds 96 KiB.\n" if length($json->encode($actions)) > MAX_CONFIG_BYTES;
-    return $actions;
+}
+
+sub validate_sized_actions {
+    my ($actions) = @_;
+    my $validated = validate_actions($actions);
+    validate_config_size($validated);
+    return $validated;
 }
 
 sub validate_actions {
@@ -134,7 +144,7 @@ sub try_lock {
 }
 
 sub read_config {
-    my ($path, $identity) = @_;
+    my ($path, $identity, $include_vault_slot) = @_;
     my ($raw, $saved);
     if (open(my $fh, '<:raw', $path)) {
         $raw = '';
@@ -150,6 +160,8 @@ sub read_config {
         die "Saved Easy Actions config is invalid.\n"
             if $@ || ref($saved) ne 'HASH' || ($saved->{version} // 0) ne '1'
             || ($saved->{identity} // '') !~ /\A[0-9a-f]{64}\z/;
+        die "Saved Easy Actions vault slot is invalid.\n"
+            if exists($saved->{vaultSlot}) && !valid_vault_slot($saved->{vaultSlot});
         $saved->{actions} = validate_actions($saved->{actions});
     } elsif ($! != ENOENT) {
         die "Unable to open Easy Actions config: $!\n";
@@ -157,6 +169,7 @@ sub read_config {
 
     # Include the guest identity even before the first save and after a guest is replaced.
     my $config = { revision => sha256_hex($identity . "\n" . ($raw // '')), actions => [] };
+    $config->{vaultSlot} = $saved ? $saved->{vaultSlot} // 0 : 0 if $include_vault_slot;
     return $config if !$saved;
     if ($saved->{identity} eq $identity) {
         $config->{actions} = $saved->{actions};
@@ -166,17 +179,37 @@ sub read_config {
     return $config;
 }
 
-sub write_config {
-    my ($directory, $path, $identity, $actions) = @_;
-    my $raw = $json->encode({ version => 1, identity => $identity, actions => $actions });
+sub valid_vault_slot {
+    my ($slot) = @_;
+    return defined($slot) && !ref($slot) && $slot =~ /\A[01]\z/;
+}
+
+sub prepare_config {
+    my ($directory, $identity, $actions, $slot) = @_;
+    $slot //= 0;
+    die "Invalid Easy Actions vault slot.\n" if !valid_vault_slot($slot);
+    validate_config_size($actions);
+    my $saved = { version => 1, identity => $identity, actions => $actions };
+    $saved->{vaultSlot} = 1 if $slot;
+    my $raw = $json->encode($saved);
     my $fh = File::Temp->new(TEMPLATE => '.config-XXXXXX', DIR => $directory, UNLINK => 1);
-    my $temporary = $fh->filename;
     binmode($fh, ':raw') or die "Unable to set Easy Actions config mode: $!\n";
     print {$fh} $raw or die "Unable to write Easy Actions config: $!\n";
     $fh->flush && $fh->sync or die "Unable to sync Easy Actions config: $!\n";
     close($fh) or die "Unable to close Easy Actions config: $!\n";
-    rename($temporary, $path) or die "Unable to save Easy Actions config: $!\n";
-    return { revision => sha256_hex($identity . "\n" . $raw), actions => $actions };
+    return ($fh, { revision => sha256_hex($identity . "\n" . $raw), actions => $actions });
+}
+
+sub publish_config {
+    my ($temporary, $path) = @_;
+    rename($temporary->filename, $path) or die "Unable to save Easy Actions config: $!\n";
+}
+
+sub write_config {
+    my ($directory, $path, $identity, $actions, $slot) = @_;
+    my ($temporary, $config) = prepare_config($directory, $identity, $actions, $slot);
+    publish_config($temporary, $path);
+    return $config;
 }
 
 1;

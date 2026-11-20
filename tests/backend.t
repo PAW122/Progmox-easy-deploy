@@ -55,7 +55,7 @@ BEGIN {
     use Exporter 'import';
     our @EXPORT_OK = qw(raise raise_param_exc raise_perm_exc);
     sub raise { die $_[0]; }
-    sub raise_param_exc { die $_[0]{actions} // $_[0]{value}; }
+    sub raise_param_exc { die join("\n", values %{ $_[0] }); }
     sub raise_perm_exc { die "Permission denied: $_[0]\n"; }
 
     package PVE::RESTHandler;
@@ -131,7 +131,9 @@ subtest 'Require root PAM on all endpoints' => sub {
     is_deeply([map { "$_->{method} $_->{path}" } @PVE::RESTHandler::methods],
         [
             'GET {type}/{vmid}', 'PUT {type}/{vmid}', 'GET {type}/{vmid}/secrets',
-            'PUT {type}/{vmid}/secrets', 'DELETE {type}/{vmid}/secrets', 'POST {type}/{vmid}/run',
+            'PUT {type}/{vmid}/secrets', 'DELETE {type}/{vmid}/secrets',
+            'GET {type}/{vmid}/copy', 'POST {type}/{vmid}/copy', 'POST {type}/{vmid}/copy-action',
+            'POST {type}/{vmid}/run',
         ],
         'registers the API routes');
     for my $method (@PVE::RESTHandler::methods) {
@@ -163,7 +165,7 @@ subtest 'Validate secret bindings and preserve legacy actions' => sub {
 };
 
 SKIP: {
-    skip 'Vault API integration requires Linux and CryptX', 1
+    skip 'Vault API integration requires Linux and CryptX', 3
         if $^O ne 'linux' || !eval { require Crypt::AuthEnc::GCM; 1 };
 
     subtest 'Save, bind and rotate a secret without returning its value' => sub {
@@ -223,6 +225,190 @@ SKIP: {
         is($endpoints{run_action}->({ %run }), 'UPID:fixture', 'unchanged action config starts again');
         shift(@PVE::RPCEnvironment::workers)->();
         is_deeply(\@resolved, ["fixture-key-v1\n", "fixture-key-v2\n"], 'next task receives the rotated value');
+    };
+
+    subtest 'Copy saved container state and preserve secret bindings on append' => sub {
+        require PVE::EasyActions::Copy;
+        my $fixture = tempdir(CLEANUP => 1);
+        my $key_directory = "$fixture/keys";
+        my %endpoints = map { $_->{name} => $_->{code} } @PVE::RESTHandler::methods;
+        my %source = (node => 'fixture', type => 'lxc', vmid => 123);
+        my %target = (%source, vmid => 124);
+        my %request = (%source, targetNode => $target{node}, targetVmid => $target{vmid});
+        my $read = \&PVE::EasyActions::Secrets::read_vault;
+        my $write = \&PVE::EasyActions::Secrets::write_vault;
+        my $step = { name => 'Check', command => 'true', timeout => 10 };
+        my $binding = { name => 'Token', env => 'DEPLOY_TOKEN', mode => 'env' };
+        my $source_action = { name => 'Deploy', steps => [$step], secrets => [$binding] };
+        my $target_action = { %$source_action, name => 'DEPLOY' };
+        my $source_secrets = {
+            Token => { value => "source-value\n", updatedAt => 12 },
+            Unbound => { value => 'unbound-value', updatedAt => 13 },
+        };
+        my $target_secrets = { Token => { value => 'target-value', updatedAt => 14 } };
+
+        no warnings qw(redefine once);
+        local $PVE::RPCEnvironment::user = 'root@pam';
+        local *PVE::INotify::nodename = sub { return 'fixture'; };
+        local *PVE::LXC::Config::lock_config_full = sub { return $_[3]->(); };
+        local *PVE::EasyActions::API::config_path = sub { return "$fixture/lxc-$_[0]{vmid}.json"; };
+        local *PVE::EasyActions::API::guest_context = sub { return (sha256_hex($_[0]{vmid}), {}); };
+        local *PVE::EasyActions::Secrets::read_vault = sub { return $read->($_[0], $_[1], $key_directory); };
+        local *PVE::EasyActions::Secrets::write_vault = sub { return $write->($_[0], $_[1], $key_directory, $_[3]); };
+
+        my $source_path = PVE::EasyActions::API::config_path(\%source);
+        my $target_path = PVE::EasyActions::API::config_path(\%target);
+        my $source_identity = sha256_hex($source{vmid});
+        my $target_identity = sha256_hex($target{vmid});
+        my $source_config = PVE::EasyActions::Config::write_config(
+            $fixture, $source_path, $source_identity, [$source_action, { name => 'Deploy (2)', steps => [$step] }],
+        );
+        $write->("$source_path.secrets", $source_identity, $key_directory, $source_secrets);
+
+        my $empty = $endpoints{inspect_copy_destination}->(\%target);
+        is_deeply([@$empty{qw(occupied actions secrets)}], [0, 0, 0], 'detects an empty container');
+        eval { $endpoints{copy_actions}->({ %request, targetVmid => $source{vmid}, mode => 'empty', revision => $empty->{revision} }); };
+        like($@, qr/Select a different container/, 'rejects self-copy');
+        is_deeply($endpoints{copy_actions}->({ %request, mode => 'empty', revision => $empty->{revision} }),
+            { actions => 2, secrets => 2 }, 'copies actions, including unbound secrets, to a fresh target');
+        my $copied = $endpoints{get_actions}->(\%target);
+        is_deeply($copied->{actions}, $source_config->{actions}, 'initial action order and names are preserved');
+        my $saved = $endpoints{save_actions}->({
+            %target, revision => $copied->{revision}, actions => JSON::PP::encode_json([$target_action]),
+        });
+        is_deeply($saved->{actions}, [$target_action], 'editing the copied actions retains the active vault');
+
+        my $metadata = $endpoints{get_secrets}->(\%target);
+        $endpoints{delete_secret}->({ %target, revision => $metadata->{revision}, name => 'Unbound' });
+        my $preview = $endpoints{inspect_copy_destination}->(\%target);
+        is_deeply([@$preview{qw(occupied actions secrets)}], [1, 1, 1], 'reports occupied without returning values');
+        $metadata = $endpoints{get_secrets}->(\%target);
+        $endpoints{save_secret}->({ %target, revision => $metadata->{revision}, name => 'Token', value => 'target-value' });
+        eval { $endpoints{copy_actions}->({ %request, mode => 'overwrite', revision => $preview->{revision} }); };
+        like($@, qr/destination configuration changed/, 'secret-only changes invalidate the destination revision');
+        $preview = $endpoints{inspect_copy_destination}->(\%target);
+        eval { $endpoints{copy_actions}->({ %request, mode => 'empty', revision => $preview->{revision} }); };
+        like($@, qr/destination configuration changed/, 'an occupied target requires an explicit mode');
+        $endpoints{copy_actions}->({ %request, mode => 'append', revision => $preview->{revision} });
+        my $appended = $endpoints{get_actions}->(\%target)->{actions};
+        is_deeply([map { $_->{name} } @$appended], ['DEPLOY', 'Deploy (3)', 'Deploy (2)'],
+            'appends in source order, avoids case-folded conflicts and preserves incoming names when possible');
+        is($appended->[0]{secrets}[0]{name}, 'Token', 'existing action keeps its binding');
+        is($appended->[1]{secrets}[0]{name}, 'Token_2', 'copied action references the renamed secret');
+        my $config = PVE::EasyActions::Config::read_config($target_path, $target_identity, 1);
+        my $vault = PVE::EasyActions::API::read_guest_vault($target_path, $target_identity, $config->{vaultSlot});
+        is_deeply({ map { $_ => $vault->{secrets}{$_}{value} } keys %{ $vault->{secrets} } },
+            { Token => $target_secrets->{Token}{value}, Token_2 => "source-value\n", Unbound => 'unbound-value' },
+            'append retains both secret values and copies the unbound secret');
+
+        $preview = $endpoints{inspect_copy_destination}->(\%target);
+        $endpoints{copy_actions}->({ %request, mode => 'overwrite', revision => $preview->{revision} });
+        $config = PVE::EasyActions::Config::read_config($target_path, $target_identity, 1);
+        is_deeply($config->{actions}, $source_config->{actions}, 'overwrite replaces the complete action list');
+        is_deeply(PVE::EasyActions::API::read_guest_vault($target_path, $target_identity, $config->{vaultSlot})->{secrets},
+            $source_secrets, 'overwrite replaces the whole live vault');
+        is_deeply($endpoints{get_actions}->(\%source), $source_config, 'copy leaves source actions intact');
+        is_deeply($read->("$source_path.secrets", $source_identity, $key_directory)->{secrets},
+            $source_secrets, 'copy leaves source secrets intact');
+    };
+
+    subtest 'Append a single saved action between a VM and a container' => sub {
+        require PVE::EasyActions::Secrets;
+        my $fixture = tempdir(CLEANUP => 1);
+        my $key_directory = "$fixture/keys";
+        my %endpoints = map { $_->{name} => $_->{code} } @PVE::RESTHandler::methods;
+        my %source = (node => 'fixture', type => 'lxc', vmid => 123);
+        my %target = (%source, type => 'qemu', vmid => 124);
+        my %types = ($source{vmid} => $source{type}, $target{vmid} => $target{type});
+        my $read = \&PVE::EasyActions::Secrets::read_vault;
+        my $write = \&PVE::EasyActions::Secrets::write_vault;
+        my @locked;
+
+        no warnings qw(redefine once);
+        local $PVE::RPCEnvironment::user = 'root@pam';
+        local *PVE::INotify::nodename = sub { return 'fixture'; };
+        my $lock_config = sub { push @locked, $_[0]; return $_[3]->(); };
+        local *PVE::LXC::Config::lock_config_full = $lock_config;
+        local *PVE::QemuConfig::lock_config_full = $lock_config;
+        local *PVE::EasyActions::API::config_path = sub { return "$fixture/$_[0]{type}-$_[0]{vmid}.json"; };
+        local *PVE::EasyActions::API::guest_context = sub {
+            my ($guest) = @_;
+            die "Guest $guest->{vmid} is no longer on this node.\n"
+                if ($types{$guest->{vmid}} // '') ne $guest->{type} || $guest->{node} ne 'fixture';
+            return (sha256_hex($guest->{vmid}), {});
+        };
+        local *PVE::EasyActions::Secrets::read_vault = sub { return $read->($_[0], $_[1], $key_directory); };
+        local *PVE::EasyActions::Secrets::write_vault = sub { return $write->($_[0], $_[1], $key_directory, $_[3]); };
+
+        my $step = { name => 'Check', command => 'true', timeout => 10 };
+        my $binding = { name => 'Token', env => 'DEPLOY_TOKEN', mode => 'env' };
+        my $file_binding = { name => 'Token', env => 'DEPLOY_TOKEN_FILE', mode => 'file' };
+        my $source_action = { name => 'Deploy', steps => [$step], secrets => [$binding, $file_binding] };
+        my $other_action = {
+            name => 'Check', steps => [$step], secrets => [{ %$binding, name => 'OtherToken' }],
+        };
+        my $target_action = { %$source_action, name => 'DEPLOY', secrets => [$binding] };
+        my $source_secrets = {
+            Token => { value => "source-value\n", updatedAt => 12 },
+            OtherToken => { value => 'other-action-value', updatedAt => 13 },
+            Unbound => { value => 'unbound-value', updatedAt => 14 },
+        };
+        my $target_secrets = { Token => { value => 'target-value', updatedAt => 15 } };
+        my $source_path = PVE::EasyActions::API::config_path(\%source);
+        my $target_path = PVE::EasyActions::API::config_path(\%target);
+        my $source_identity = sha256_hex($source{vmid});
+        my $target_identity = sha256_hex($target{vmid});
+        my $source_config = PVE::EasyActions::Config::write_config(
+            $fixture, $source_path, $source_identity, [$source_action, $other_action],
+        );
+        PVE::EasyActions::Config::write_config($fixture, $target_path, $target_identity, [$target_action]);
+        $write->("$source_path.secrets", $source_identity, $key_directory, $source_secrets);
+        $write->("$target_path.secrets", $target_identity, $key_directory, $target_secrets);
+
+        my $preview = $endpoints{inspect_copy_destination}->(\%target);
+        is_deeply([@$preview{qw(actions secrets)}], [1, 1], 'the preview reads an occupied VM');
+        my %request = (
+            %source, name => 'Deploy', sourceRevision => $source_config->{revision},
+            targetType => $target{type}, targetNode => $target{node}, targetVmid => $target{vmid},
+            revision => $preview->{revision},
+        );
+        my $copy_action = $endpoints{copy_selected_action};
+        eval { $copy_action->({ %request, sourceRevision => '0' x 64 }); };
+        like($@, qr/configuration changed/i, 'rejects a stale source revision');
+        eval { $copy_action->({ %request, targetVmid => $source{vmid}, targetType => $source{type} }); };
+        like($@, qr/Select a different/i, 'rejects copying to the source guest');
+        eval { $copy_action->({ %request, targetVmid => 999 }); };
+        like($@, qr/no longer on this node/i, 'rejects a missing destination');
+        eval { $copy_action->({ %request, revision => '0' x 64 }); };
+        like($@, qr/destination configuration changed/i, 'rejects a stale VM destination revision');
+        is_deeply($endpoints{inspect_copy_destination}->(\%target), $preview, 'rejections preserve the destination');
+
+        is_deeply($copy_action->({ %request }), { actions => 1, secrets => 1 },
+            'copies the selected action and its one distinct bound secret');
+        is($locked[-1], 'PVE::QemuConfig', 'copies under the VM configuration lock');
+        my $target_config = PVE::EasyActions::Config::read_config($target_path, $target_identity, 1);
+        my $copied_action = {
+            %$source_action, name => 'Deploy (2)',
+            secrets => [map { { %$_, name => 'Token_2' } } @{ $source_action->{secrets} }],
+        };
+        is_deeply($target_config->{actions}, [$target_action, $copied_action],
+            'appends only the selected action and remaps both bindings');
+        is_deeply(PVE::EasyActions::API::read_guest_vault($target_path, $target_identity, $target_config->{vaultSlot})->{secrets},
+            { %$target_secrets, Token_2 => $source_secrets->{Token} },
+            'retains the previous VM secret and excludes unrelated source secrets');
+        is_deeply($endpoints{get_actions}->(\%source), $source_config, 'copy leaves the source actions unchanged');
+        is_deeply($read->("$source_path.secrets", $source_identity, $key_directory)->{secrets},
+            $source_secrets, 'copy leaves the source secrets unchanged');
+
+        $preview = $endpoints{inspect_copy_destination}->(\%source);
+        is_deeply($copy_action->({
+            %target, name => $copied_action->{name}, sourceRevision => $target_config->{revision},
+            targetType => $source{type}, targetNode => $source{node}, targetVmid => $source{vmid},
+            revision => $preview->{revision},
+        }), { actions => 1, secrets => 1 }, 'also copies a VM action to a container');
+        is($locked[-1], 'PVE::LXC::Config', 'copies under the container configuration lock');
+        is_deeply($endpoints{get_actions}->(\%source)->{actions}, [$source_action, $other_action, $copied_action],
+            'the container keeps its original actions and receives the selected VM action');
     };
 }
 

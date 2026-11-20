@@ -1,0 +1,46 @@
+#!/usr/bin/perl -T
+# SPDX-License-Identifier: AGPL-3.0-or-later
+use strict;
+use warnings;
+
+use HTTP::Status qw(HTTP_CONFLICT HTTP_NOT_FOUND);
+use JSON::PP ();
+
+use PVE::EasyActions::API ();
+use PVE::EasyActions::Copy ();
+use PVE::EasyActions::Secrets ();
+
+die "Easy Actions copy requires root.\n" if $> != 0 || @ARGV;
+binmode(STDIN, ':raw') or die "Could not read the copy request.\n";
+
+my $raw = '';
+while (1) {
+    my $bytes = read(STDIN, my $chunk, 8192);
+    die "Could not read the copy request.\n" if !defined($bytes);
+    last if !$bytes;
+    $raw .= $chunk;
+    die "Easy Actions copy exceeds the transfer size limit.\n"
+        if length($raw) > PVE::EasyActions::Copy::MAX_TRANSFER_BYTES();
+}
+
+my $request = eval {
+    my $decoded = JSON::PP::decode_json($raw);
+    die if ref($decoded) ne 'HASH' || ref($decoded->{secrets});
+    $decoded->{secrets} = PVE::EasyActions::Secrets::decode_secrets($decoded->{secrets} // '');
+    $decoded;
+};
+die "Invalid Easy Actions copy request.\n" if !$request;
+
+my $result = eval {
+    PVE::EasyActions::API::apply_copy($request);
+    { ok => 1 };
+};
+if (!$result) {
+    my $error = $@;
+    $result = { error => 'The destination node could not save the configuration.' };
+    if (ref($error) eq 'PVE::Exception' && defined($error->{code})
+        && ($error->{code} == HTTP_CONFLICT || $error->{code} == HTTP_NOT_FOUND)) {
+        $result = { error => $error->{msg}, code => $error->{code} };
+    }
+}
+print JSON::PP::encode_json($result), "\n";

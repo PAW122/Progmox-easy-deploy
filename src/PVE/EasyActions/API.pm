@@ -66,6 +66,27 @@ my $secret_response = {
         },
     },
 };
+my %copy_params = (
+    %guest_params,
+    type => { type => 'string', enum => ['lxc'], description => 'Container type.' },
+);
+my %copy_endpoint = (
+    path => '{type}/{vmid}/copy',
+    protected => 1,
+    proxyto => 'node',
+    allowtoken => 0,
+    permissions => { description => 'Restricted to root@pam.' },
+);
+my %copy_counts = (
+    actions => { type => 'integer', minimum => 0 },
+    secrets => { type => 'integer', minimum => 0 },
+);
+my %copy_target_params = (
+    targetNode => get_standard_option('pve-node'),
+    targetVmid => get_standard_option('pve-vmid'),
+    revision => $revision,
+);
+my $action_name = { type => 'string', minLength => 1, maxLength => 64, description => 'Action name.' };
 
 sub admin_environment {
     my $rpcenv = PVE::RPCEnvironment::get();
@@ -145,9 +166,10 @@ sub verify_revision {
 }
 
 sub read_guest_vault {
-    my ($path, $identity) = @_;
+    my ($path, $identity, $slot) = @_;
     require PVE::EasyActions::Secrets;
-    return PVE::EasyActions::Secrets::read_vault("$path.secrets", $identity, KEY_DIRECTORY);
+    my $vault_path = PVE::EasyActions::Secrets::guest_vault_path($path, $slot);
+    return PVE::EasyActions::Secrets::read_vault($vault_path, $identity, KEY_DIRECTORY);
 }
 
 sub secret_metadata {
@@ -191,13 +213,13 @@ sub edit_guest_secret {
     my $path = config_path($params);
     my $lock = lock_configuration($path);
     my ($identity) = guest_context($params);
-    my $vault = read_guest_vault($path, $identity);
+    my $config = PVE::EasyActions::Config::read_config($path, $identity, 1);
+    my $vault = read_guest_vault($path, $identity, $config->{vaultSlot});
     raise("The secret list changed. Reload it and try again.\n", code => HTTP_CONFLICT)
         if $vault->{revision} ne $params->{revision};
     my $secrets = $vault->{secrets};
     if ($remove) {
         raise("This secret does not exist.\n", code => HTTP_NOT_FOUND) if !exists($secrets->{$name});
-        my $config = PVE::EasyActions::Config::read_config($path, $identity);
         for my $action (@{ $config->{actions} }) {
             raise("This secret is assigned to an action. Remove the binding in Config first.\n",
                 code => HTTP_CONFLICT)
@@ -209,9 +231,133 @@ sub edit_guest_secret {
             if !exists($secrets->{$name}) && keys(%$secrets) >= PVE::EasyActions::Secrets::MAX_SECRETS();
         $secrets->{$name} = { value => $value, updatedAt => time() };
     }
-    return secret_metadata(
-        PVE::EasyActions::Secrets::write_vault("$path.secrets", $identity, KEY_DIRECTORY, $secrets),
-    );
+    my $vault_path = PVE::EasyActions::Secrets::guest_vault_path($path, $config->{vaultSlot});
+    return secret_metadata(PVE::EasyActions::Secrets::write_vault($vault_path, $identity, KEY_DIRECTORY, $secrets));
+}
+
+sub copy_guest_context {
+    my ($params) = @_;
+    my ($identity, $native) = guest_context($params);
+    raise("Choose a VM or container outside template mode.\n", code => HTTP_CONFLICT) if $native->{template};
+    raise("This guest is locked by another Proxmox operation. Try again.\n", code => HTTP_CONFLICT)
+        if $native->{lock};
+    return $identity;
+}
+
+sub read_copy_state {
+    my ($path, $identity) = @_;
+    my $config = PVE::EasyActions::Config::read_config($path, $identity, 1);
+    my $vault = read_guest_vault($path, $identity, $config->{vaultSlot});
+    my $metadata = {
+        revision => sha256_hex($config->{revision} . $vault->{revision}),
+        actions => scalar(@{ $config->{actions} }),
+        secrets => scalar(keys %{ $vault->{secrets} }),
+    };
+    $metadata->{occupied} = ($metadata->{actions} || $metadata->{secrets}) ? 1 : 0;
+    return ($metadata, $config, $vault);
+}
+
+sub apply_copy {
+    my ($request) = @_;
+    require PVE::EasyActions::Copy;
+
+    my ($vmid) = ($request->{vmid} // '') =~ /\A([1-9][0-9]{2,8})\z/;
+    my $node = PVE::INotify::nodename();
+    # Earlier senders omitted the type because full copies always targeted LXC.
+    my ($type) = ($request->{type} // 'lxc') =~ /\A(qemu|lxc)\z/;
+    my $mode = $request->{mode} // '';
+    die "Invalid Easy Actions copy request.\n"
+        if !defined($vmid) || !defined($type) || ($request->{node} // '') ne $node
+        || $mode !~ /\A(?:empty|append|overwrite)\z/
+        || ($request->{revision} // '') !~ /\A[0-9a-f]{64}\z/;
+
+    my $incoming_actions = PVE::EasyActions::Config::validate_sized_actions($request->{actions});
+    my $incoming_secrets = PVE::EasyActions::Secrets::validate_secrets($request->{secrets});
+    resolve_action_secrets($_, $incoming_secrets) for @$incoming_actions;
+
+    my $target = { node => $node, type => $type, vmid => $vmid };
+    my $class = $type eq 'qemu' ? 'PVE::QemuConfig' : 'PVE::LXC::Config';
+    return $class->lock_config_full($vmid, 3, sub {
+        my $path = config_path($target);
+        my $lock = lock_configuration($path);
+        my $identity = copy_guest_context($target);
+        my ($metadata, $config, $vault) = read_copy_state($path, $identity);
+        raise("The destination configuration changed. Select it again and review the copy options.\n",
+            code => HTTP_CONFLICT)
+            if $metadata->{revision} ne $request->{revision} || ($mode eq 'empty' && $metadata->{occupied});
+
+        my ($actions, $secrets) = ($incoming_actions, $incoming_secrets);
+        if ($mode eq 'append') {
+            ($actions, $secrets) = PVE::EasyActions::Copy::append(
+                $config->{actions}, $vault->{secrets}, $incoming_actions, $incoming_secrets,
+            );
+        }
+        raise("The destination would exceed the limit of 24 secrets.\n", code => HTTP_CONFLICT)
+            if keys(%$secrets) > PVE::EasyActions::Secrets::MAX_SECRETS();
+        $actions = eval { PVE::EasyActions::Config::validate_sized_actions($actions) };
+        raise($@, code => HTTP_CONFLICT) if $@;
+        resolve_action_secrets($_, $secrets) for @$actions;
+
+        PVE::EasyActions::Secrets::replace_guest_state(
+            $path, $identity, KEY_DIRECTORY, $actions, $secrets, $config->{vaultSlot},
+        );
+        return { actions => scalar(@$incoming_actions), secrets => scalar(keys %$incoming_secrets) };
+    });
+}
+
+sub copy_from_guest {
+    my ($params, $selected) = @_;
+    admin_environment();
+    my ($target_node, $target_vmid) = @{$params}{qw(targetNode targetVmid)};
+    my $target_type = $selected ? $params->{targetType} : 'lxc';
+    raise_param_exc({ targetVmid => $selected ? 'Select a different guest.' : 'Select a different container.' })
+        if $target_vmid == $params->{vmid};
+
+    my $path = config_path($params);
+    my $lock = lock_configuration($path);
+    my $identity = copy_guest_context($params);
+    my $config = PVE::EasyActions::Config::read_config($path, $identity, 1);
+    my $actions = $config->{actions};
+    my $bindings = [];
+    if ($selected) {
+        verify_revision($config, $params->{sourceRevision});
+        my ($action) = grep { $_->{name} eq $params->{name} } @$actions;
+        raise("The selected action is not configured for this guest.\n", code => HTTP_NOT_FOUND) if !$action;
+        $actions = [$action];
+        $bindings = $action->{secrets} // [];
+    }
+
+    my $secrets = !$selected || @$bindings ? read_guest_vault($path, $identity, $config->{vaultSlot})->{secrets} : {};
+    close($lock);
+    raise("There are no saved actions or secrets to copy.\n", code => HTTP_CONFLICT)
+        if !@$actions && !keys(%$secrets);
+    resolve_action_secrets($_, $secrets) for @$actions;
+    $secrets = { map { $_->{name} => $secrets->{$_->{name}} } @$bindings } if $selected;
+
+    my $request = {
+        node => $target_node, vmid => $target_vmid, type => $target_type,
+        mode => $selected ? 'append' : $params->{mode}, revision => $params->{revision},
+        actions => $actions, secrets => $secrets,
+    };
+    return apply_copy($request) if $target_node eq $params->{node};
+
+    PVE::Cluster::cfs_update(1);
+    my $target = PVE::Cluster::get_vmlist()->{ids}{$target_vmid};
+    raise("The destination guest is no longer on the selected node.\n", code => HTTP_NOT_FOUND)
+        if !$target || $target->{type} ne $target_type || $target->{node} ne $target_node;
+    require PVE::EasyActions::Copy;
+    my $result = eval { PVE::EasyActions::Copy::send_to_node($target_node, $request) };
+    die "Could not confirm the copy on the destination node. Reopen Copy to check its configuration.\n"
+        if !$result;
+    if ($result->{error}) {
+        my $code = $result->{code};
+        raise($result->{error}, code => $code)
+            if defined($code) && ($code == HTTP_CONFLICT || $code == HTTP_NOT_FOUND);
+        die "The destination node could not save the Easy Actions configuration.\n";
+    }
+    die "Could not confirm the copy on the destination node. Reopen Copy to check its configuration.\n"
+        if !$result->{ok};
+    return { actions => scalar(@$actions), secrets => scalar(keys %$secrets) };
 }
 
 __PACKAGE__->register_method({
@@ -263,13 +409,13 @@ __PACKAGE__->register_method({
         my $path = config_path($params);
         my $lock = lock_configuration($path);
         my ($identity) = guest_context($params);
-        my $current = PVE::EasyActions::Config::read_config($path, $identity);
+        my $current = PVE::EasyActions::Config::read_config($path, $identity, 1);
         verify_revision($current, $params->{revision});
         if (grep { $_->{secrets} } @$actions) {
-            my $vault = read_guest_vault($path, $identity);
+            my $vault = read_guest_vault($path, $identity, $current->{vaultSlot});
             resolve_action_secrets($_, $vault->{secrets}) for @$actions;
         }
-        return PVE::EasyActions::Config::write_config(dirname($path), $path, $identity, $actions);
+        return PVE::EasyActions::Config::write_config(dirname($path), $path, $identity, $actions, $current->{vaultSlot});
     },
 });
 
@@ -283,8 +429,11 @@ __PACKAGE__->register_method({
     code => sub {
         my ($params) = @_;
         admin_environment();
+        my $path = config_path($params);
+        my $lock = lock_configuration($path);
         my ($identity) = guest_context($params);
-        return secret_metadata(read_guest_vault(config_path($params), $identity));
+        my $config = PVE::EasyActions::Config::read_config($path, $identity, 1);
+        return secret_metadata(read_guest_vault($path, $identity, $config->{vaultSlot}));
     },
 });
 
@@ -325,6 +474,64 @@ __PACKAGE__->register_method({
 });
 
 __PACKAGE__->register_method({
+    %copy_endpoint,
+    name => 'inspect_copy_destination',
+    method => 'GET',
+    description => 'Inspect a guest configuration before copying actions and secrets to it.',
+    parameters => { additionalProperties => 0, properties => { %guest_params } },
+    returns => {
+        type => 'object',
+        properties => { %copy_counts, revision => $revision, occupied => { type => 'boolean' } },
+    },
+    code => sub {
+        my ($params) = @_;
+        admin_environment();
+        my $path = config_path($params);
+        my $lock = lock_configuration($path);
+        my $identity = copy_guest_context($params);
+        my ($metadata) = read_copy_state($path, $identity);
+        return $metadata;
+    },
+});
+
+__PACKAGE__->register_method({
+    %copy_endpoint,
+    name => 'copy_actions',
+    method => 'POST',
+    description => 'Copy saved actions and secrets to another container.',
+    parameters => {
+        additionalProperties => 0,
+        properties => {
+            %copy_params,
+            %copy_target_params,
+            mode => { type => 'string', enum => ['empty', 'append', 'overwrite'] },
+        },
+    },
+    returns => { type => 'object', properties => { %copy_counts } },
+    code => \&copy_from_guest,
+});
+
+__PACKAGE__->register_method({
+    %copy_endpoint,
+    path => '{type}/{vmid}/copy-action',
+    name => 'copy_selected_action',
+    method => 'POST',
+    description => 'Append one saved action and its bound secrets to another VM or container.',
+    parameters => {
+        additionalProperties => 0,
+        properties => {
+            %guest_params,
+            %copy_target_params,
+            name => $action_name,
+            sourceRevision => $revision,
+            targetType => { %{$guest_params{type}}, description => 'Destination guest type.' },
+        },
+    },
+    returns => { type => 'object', properties => { %copy_counts } },
+    code => sub { return copy_from_guest($_[0], 1); },
+});
+
+__PACKAGE__->register_method({
     name => 'run_action',
     path => '{type}/{vmid}/run',
     method => 'POST',
@@ -338,7 +545,7 @@ __PACKAGE__->register_method({
         properties => {
             %guest_params,
             revision => $revision,
-            name => { type => 'string', minLength => 1, maxLength => 64, description => 'Action name.' },
+            name => $action_name,
         },
     },
     returns => { type => 'string', description => 'Proxmox task UPID.' },
@@ -350,7 +557,7 @@ __PACKAGE__->register_method({
         # Snapshot the action and all of its secrets under the same lock. The
         # worker keeps this version even if a secret is rotated during the run.
         my $configuration_lock = lock_configuration($path);
-        my $config = PVE::EasyActions::Config::read_config($path, $identity);
+        my $config = PVE::EasyActions::Config::read_config($path, $identity, 1);
         verify_revision($config, $params->{revision});
         my ($action) = grep { $_->{name} eq $params->{name} } @{ $config->{actions} };
         raise("The action is not configured for this guest.\n", code => HTTP_NOT_FOUND) if !$action;
@@ -361,7 +568,7 @@ __PACKAGE__->register_method({
         raise("An action is already running for this guest.\n", code => HTTP_CONFLICT) if !$lock;
         my $resolved = [];
         if ($action->{secrets}) {
-            my $vault = read_guest_vault($path, $identity);
+            my $vault = read_guest_vault($path, $identity, $config->{vaultSlot});
             $resolved = resolve_action_secrets($action, $vault->{secrets});
         }
         close($configuration_lock);
