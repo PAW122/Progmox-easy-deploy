@@ -43,6 +43,11 @@ my $config_response = {
         previousActions => { type => 'array', items => { type => 'object' }, optional => 1 },
     },
 };
+my $actions_param = {
+    type => 'string',
+    maxLength => PVE::EasyActions::Config::MAX_CONFIG_BYTES(),
+    description => 'JSON-encoded array of actions.',
+};
 my %secret_endpoint = (
     path => '{type}/{vmid}/secrets',
     protected => 1,
@@ -60,7 +65,8 @@ my $secret_response = {
                 type => 'object',
                 properties => {
                     name => { type => 'string' },
-                    updatedAt => { type => 'integer' },
+                    updatedAt => { type => 'integer', optional => 1 },
+                    missing => { type => 'boolean', optional => 1 },
                 },
             },
         },
@@ -172,24 +178,39 @@ sub read_guest_vault {
     return PVE::EasyActions::Secrets::read_vault($vault_path, $identity, KEY_DIRECTORY);
 }
 
+sub missing_secret_names {
+    my ($actions, $secrets) = @_;
+    my %missing;
+    for my $action (@$actions) {
+        for my $binding (@{ $action->{secrets} // [] }) {
+            my $name = $binding->{name};
+            $missing{$name} = 1 if !exists($secrets->{$name});
+        }
+    }
+    return \%missing;
+}
+
 sub secret_metadata {
-    my ($vault) = @_;
+    my ($vault, $actions) = @_;
+    my $secrets = $vault->{secrets};
+    my $missing = missing_secret_names($actions, $secrets);
     return {
         revision => $vault->{revision},
         secrets => [
-            map { { name => $_, updatedAt => $vault->{secrets}{$_}{updatedAt} } }
-                sort keys %{ $vault->{secrets} }
+            map { $missing->{$_} ? { name => $_, missing => 1 } : { name => $_, updatedAt => $secrets->{$_}{updatedAt} } }
+                sort(keys(%$secrets), keys(%$missing))
         ],
     };
 }
 
 sub resolve_action_secrets {
-    my ($action, $secrets) = @_;
+    my ($action, $secrets, $allowed_missing) = @_;
     my @resolved;
     my $total_bytes = 0;
     for my $binding (@{ $action->{secrets} // [] }) {
         my $name = $binding->{name};
         my $record = $secrets->{$name};
+        next if !$record && $allowed_missing && $allowed_missing->{$name};
         raise("The secret '$name' is missing for this guest. Open Actions > Secrets to add it.\n",
             code => HTTP_CONFLICT) if !$record;
         $total_bytes += length(encode_utf8($record->{value}));
@@ -219,12 +240,12 @@ sub edit_guest_secret {
         if $vault->{revision} ne $params->{revision};
     my $secrets = $vault->{secrets};
     if ($remove) {
-        raise("This secret does not exist.\n", code => HTTP_NOT_FOUND) if !exists($secrets->{$name});
         for my $action (@{ $config->{actions} }) {
             raise("This secret is assigned to an action. Remove the binding in Config first.\n",
                 code => HTTP_CONFLICT)
                     if grep { $_->{name} eq $name } @{ $action->{secrets} // [] };
         }
+        raise("This secret does not exist.\n", code => HTTP_NOT_FOUND) if !exists($secrets->{$name});
         delete($secrets->{$name});
     } else {
         raise("A guest can have up to 24 secrets.\n", code => HTTP_CONFLICT)
@@ -232,7 +253,8 @@ sub edit_guest_secret {
         $secrets->{$name} = { value => $value, updatedAt => time() };
     }
     my $vault_path = PVE::EasyActions::Secrets::guest_vault_path($path, $config->{vaultSlot});
-    return secret_metadata(PVE::EasyActions::Secrets::write_vault($vault_path, $identity, KEY_DIRECTORY, $secrets));
+    my $saved = PVE::EasyActions::Secrets::write_vault($vault_path, $identity, KEY_DIRECTORY, $secrets);
+    return secret_metadata($saved, $config->{actions});
 }
 
 sub copy_guest_context {
@@ -273,7 +295,8 @@ sub apply_copy {
 
     my $incoming_actions = PVE::EasyActions::Config::validate_sized_actions($request->{actions});
     my $incoming_secrets = PVE::EasyActions::Secrets::validate_secrets($request->{secrets});
-    resolve_action_secrets($_, $incoming_secrets) for @$incoming_actions;
+    my $incoming_missing = missing_secret_names($incoming_actions, $incoming_secrets);
+    resolve_action_secrets($_, $incoming_secrets, $incoming_missing) for @$incoming_actions;
 
     my $target = { node => $node, type => $type, vmid => $vmid };
     my $class = $type eq 'qemu' ? 'PVE::QemuConfig' : 'PVE::LXC::Config';
@@ -296,7 +319,8 @@ sub apply_copy {
             if keys(%$secrets) > PVE::EasyActions::Secrets::MAX_SECRETS();
         $actions = eval { PVE::EasyActions::Config::validate_sized_actions($actions) };
         raise($@, code => HTTP_CONFLICT) if $@;
-        resolve_action_secrets($_, $secrets) for @$actions;
+        my $missing = missing_secret_names($actions, $secrets);
+        resolve_action_secrets($_, $secrets, $missing) for @$actions;
 
         PVE::EasyActions::Secrets::replace_guest_state(
             $path, $identity, KEY_DIRECTORY, $actions, $secrets, $config->{vaultSlot},
@@ -331,8 +355,9 @@ sub copy_from_guest {
     close($lock);
     raise("There are no saved actions or secrets to copy.\n", code => HTTP_CONFLICT)
         if !@$actions && !keys(%$secrets);
-    resolve_action_secrets($_, $secrets) for @$actions;
-    $secrets = { map { $_->{name} => $secrets->{$_->{name}} } @$bindings } if $selected;
+    my $missing = missing_secret_names($actions, $secrets);
+    resolve_action_secrets($_, $secrets, $missing) for @$actions;
+    $secrets = { map { $_->{name} => $secrets->{$_->{name}} } grep { !$missing->{$_->{name}} } @$bindings } if $selected;
 
     my $request = {
         node => $target_node, vmid => $target_vmid, type => $target_type,
@@ -393,11 +418,7 @@ __PACKAGE__->register_method({
         properties => {
             %guest_params,
             revision => $revision,
-            actions => {
-                type => 'string',
-                maxLength => PVE::EasyActions::Config::MAX_CONFIG_BYTES(),
-                description => 'JSON-encoded array of actions.',
-            },
+            actions => $actions_param,
         },
     },
     returns => $config_response,
@@ -413,9 +434,64 @@ __PACKAGE__->register_method({
         verify_revision($current, $params->{revision});
         if (grep { $_->{secrets} } @$actions) {
             my $vault = read_guest_vault($path, $identity, $current->{vaultSlot});
-            resolve_action_secrets($_, $vault->{secrets}) for @$actions;
+            my $missing = missing_secret_names($current->{actions}, $vault->{secrets});
+            resolve_action_secrets($_, $vault->{secrets}, $missing) for @$actions;
         }
         return PVE::EasyActions::Config::write_config(dirname($path), $path, $identity, $actions, $current->{vaultSlot});
+    },
+});
+
+__PACKAGE__->register_method({
+    name => 'import_actions',
+    path => '{type}/{vmid}/import',
+    method => 'POST',
+    description => 'Import actions and secret bindings from a configuration file.',
+    protected => 1,
+    proxyto => 'node',
+    allowtoken => 0,
+    permissions => { description => 'Restricted to root@pam.' },
+    parameters => {
+        additionalProperties => 0,
+        properties => {
+            %guest_params,
+            revision => $revision,
+            mode => { type => 'string', enum => ['append', 'overwrite'] },
+            actions => $actions_param,
+        },
+    },
+    returns => {
+        type => 'object',
+        properties => {
+            %{ $config_response->{properties} },
+            missingSecrets => { type => 'array', items => { type => 'string' } },
+        },
+    },
+    code => sub {
+        my ($params) = @_;
+        admin_environment();
+        my $actions = eval { PVE::EasyActions::Config::decode_actions($params->{actions}) };
+        raise_param_exc({ actions => $@ }) if $@;
+
+        my $path = config_path($params);
+        my $lock = lock_configuration($path);
+        my ($identity) = guest_context($params);
+        my $current = PVE::EasyActions::Config::read_config($path, $identity, 1);
+        verify_revision($current, $params->{revision});
+
+        if ($params->{mode} eq 'append') {
+            require PVE::EasyActions::Copy;
+            ($actions) = PVE::EasyActions::Copy::append($current->{actions}, {}, $actions, {});
+            $actions = eval { PVE::EasyActions::Config::validate_sized_actions($actions) };
+            raise($@, code => HTTP_CONFLICT) if $@;
+        }
+        my $missing = {};
+        if (grep { $_->{secrets} } @$actions) {
+            my $vault = read_guest_vault($path, $identity, $current->{vaultSlot});
+            $missing = missing_secret_names($actions, $vault->{secrets});
+            resolve_action_secrets($_, $vault->{secrets}, $missing) for @$actions;
+        }
+        my $saved = PVE::EasyActions::Config::write_config(dirname($path), $path, $identity, $actions, $current->{vaultSlot});
+        return { %$saved, missingSecrets => [sort keys %$missing] };
     },
 });
 
@@ -423,7 +499,7 @@ __PACKAGE__->register_method({
     %secret_endpoint,
     name => 'get_secrets',
     method => 'GET',
-    description => 'List the secret names and modification times for a guest.',
+    description => 'List saved and missing secret names for a guest.',
     parameters => { additionalProperties => 0, properties => { %guest_params } },
     returns => $secret_response,
     code => sub {
@@ -433,7 +509,8 @@ __PACKAGE__->register_method({
         my $lock = lock_configuration($path);
         my ($identity) = guest_context($params);
         my $config = PVE::EasyActions::Config::read_config($path, $identity, 1);
-        return secret_metadata(read_guest_vault($path, $identity, $config->{vaultSlot}));
+        my $vault = read_guest_vault($path, $identity, $config->{vaultSlot});
+        return secret_metadata($vault, $config->{actions});
     },
 });
 

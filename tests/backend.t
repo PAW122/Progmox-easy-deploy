@@ -130,7 +130,7 @@ subtest 'Validate and save guest actions' => sub {
 subtest 'Require root PAM on all endpoints' => sub {
     is_deeply([map { "$_->{method} $_->{path}" } @PVE::RESTHandler::methods],
         [
-            'GET {type}/{vmid}', 'PUT {type}/{vmid}', 'GET {type}/{vmid}/secrets',
+            'GET {type}/{vmid}', 'PUT {type}/{vmid}', 'POST {type}/{vmid}/import', 'GET {type}/{vmid}/secrets',
             'PUT {type}/{vmid}/secrets', 'DELETE {type}/{vmid}/secrets',
             'GET {type}/{vmid}/copy', 'POST {type}/{vmid}/copy', 'POST {type}/{vmid}/copy-action',
             'POST {type}/{vmid}/run',
@@ -185,7 +185,7 @@ subtest 'Validate and persist optional action groups' => sub {
 };
 
 SKIP: {
-    skip 'Vault API integration requires Linux and CryptX', 3
+    skip 'Vault API integration requires Linux and CryptX', 4
         if $^O ne 'linux' || !eval { require Crypt::AuthEnc::GCM; 1 };
 
     subtest 'Save, bind and rotate a secret without returning its value' => sub {
@@ -246,6 +246,139 @@ SKIP: {
         is($endpoints{run_action}->({ %run }), 'UPID:fixture', 'unchanged action config starts again');
         shift(@PVE::RPCEnvironment::workers)->();
         is_deeply(\@resolved, ["fixture-key-v1\n", "fixture-key-v2\n"], 'next task receives the rotated value');
+    };
+
+    subtest 'Import action configuration and fill pending secret bindings' => sub {
+        require PVE::EasyActions::Secrets;
+        my $fixture = tempdir(CLEANUP => 1);
+        my $key_directory = "$fixture/keys";
+        my %api = map { $_->{name} => $_->{code} } @PVE::RESTHandler::methods;
+        my %guest = (node => 'fixture', type => 'lxc', vmid => 123);
+        my %target = (%guest, type => 'qemu', vmid => 124);
+        my %fresh = (%guest, vmid => 125);
+        my $read = \&PVE::EasyActions::Secrets::read_vault;
+        my $write = \&PVE::EasyActions::Secrets::write_vault;
+        my @resolved;
+
+        no warnings qw(redefine once);
+        local $PVE::RPCEnvironment::user = 'root@pam';
+        local @PVE::RPCEnvironment::workers;
+        local *PVE::INotify::nodename = sub { return 'fixture'; };
+        local *PVE::LXC::Config::lock_config_full = sub { return $_[3]->(); };
+        local *PVE::QemuConfig::lock_config_full = sub { return $_[3]->(); };
+        local *PVE::EasyActions::API::config_path = sub { return "$fixture/$_[0]{type}-$_[0]{vmid}.json"; };
+        local *PVE::EasyActions::API::guest_context = sub { return (sha256_hex($_[0]{vmid}), {}); };
+        local *PVE::EasyActions::Secrets::read_vault = sub { return $read->($_[0], $_[1], $key_directory); };
+        local *PVE::EasyActions::Secrets::write_vault = sub { return $write->($_[0], $_[1], $key_directory, $_[3]); };
+        local *PVE::EasyActions::Runner::run_action = sub { @resolved = map { $_->{value} } @{ $_[4] }; };
+
+        my $save_secret = sub {
+            my ($params, $name, $value) = @_;
+            my $metadata = $api{get_secrets}->({ %$params });
+            return $api{save_secret}->({ %$params, revision => $metadata->{revision}, name => $name, value => $value });
+        };
+        $save_secret->(\%guest, 'Known', 'existing value');
+        $save_secret->(\%guest, 'Retained', 'unbound value');
+        $save_secret->(\%target, 'Missing', 'destination value');
+        my $step = { name => 'Check', command => 'true', timeout => 10 };
+        my $old_action = { name => 'DEPLOY', steps => [$step] };
+        my $old = $api{save_actions}->({
+            %guest, revision => $api{get_actions}->(\%guest)->{revision}, actions => JSON::PP::encode_json([$old_action]),
+        });
+        my $action = {
+            name => 'Deploy', group => 'Release', steps => [$step],
+            secrets => [{ name => 'Known', env => 'KNOWN', mode => 'env' }, { name => 'Missing', env => 'MISSING', mode => 'file' }],
+        };
+        my $other_action = {
+            name => 'Deploy (2)', steps => [$step], secrets => [{ name => 'OtherMissing', env => 'OTHER', mode => 'env' }],
+        };
+        my %request = (%guest, revision => $old->{revision}, mode => 'append');
+        eval {
+            $api{import_actions}->({
+                %request, actions => JSON::PP::encode_json([
+                    { %$action, secrets => [{ %{ $action->{secrets}[0] }, value => 'import must not accept values' }] },
+                ]),
+            });
+        };
+        like($@, qr/invalid secret binding/, 'an import cannot include secret values');
+        my $imported = $api{import_actions}->({ %request, actions => JSON::PP::encode_json([$action, $other_action]) });
+        my $appended = { %$action, name => 'Deploy (3)' };
+        is_deeply($imported->{actions}, [$old_action, $appended, $other_action], 'append keeps order, group and bindings');
+        is_deeply($imported->{missingSecrets}, ['Missing', 'OtherMissing'], 'only missing secret names are reported');
+        eval { $api{import_actions}->({ %request, actions => '[]' }); };
+        like($@, qr/configuration changed/, 'stale import cannot overwrite subsequent edits');
+        my $metadata = $api{get_secrets}->(\%guest);
+        is_deeply([grep { $_->{missing} } @{ $metadata->{secrets} }],
+            [{ name => 'Missing', missing => 1 }, { name => 'OtherMissing', missing => 1 }],
+            'pending entries expose only name and status');
+        eval {
+            $api{delete_secret}->({ %guest, revision => $metadata->{revision}, name => 'Missing' });
+        };
+        like($@, qr/assigned to an action/, 'pending bindings have the same delete guard');
+        my %run = (%guest, name => $appended->{name}, revision => $imported->{revision});
+        eval { $api{run_action}->({ %run }); };
+        like($@, qr/'Missing' is missing/, 'an action with a pending binding cannot start');
+        eval {
+            $api{save_actions}->({
+                %guest, revision => $imported->{revision}, actions => JSON::PP::encode_json([
+                    { %$appended, secrets => [{ name => 'NotImported', env => 'NEW', mode => 'env' }] },
+                ]),
+            });
+        };
+        like($@, qr/'NotImported' is missing/, 'normal save rejects unrelated missing bindings');
+        my $edited = $api{save_actions}->({
+            %guest, revision => $imported->{revision},
+            actions => JSON::PP::encode_json([$old_action, { %$appended, group => 'Test' }, $other_action]),
+        });
+        is($edited->{actions}[1]{group}, 'Test', 'normal save can retain a pending binding while editing');
+
+        my $target_action = {
+            name => 'Waiting', steps => [$step], secrets => [{ name => 'Known', env => 'WAITING', mode => 'env' }],
+        };
+        $api{import_actions}->({
+            %target, mode => 'overwrite', revision => $api{get_actions}->(\%target)->{revision},
+            actions => JSON::PP::encode_json([$target_action]),
+        });
+        my $preview = $api{inspect_copy_destination}->(\%target);
+        my $copied = $api{copy_selected_action}->({
+            %guest, name => $appended->{name}, sourceRevision => $edited->{revision}, revision => $preview->{revision},
+            targetNode => $target{node}, targetType => $target{type}, targetVmid => $target{vmid},
+        });
+        is_deeply($copied, { actions => 1, secrets => 1 }, 'selected copy transfers only available bound values');
+        is_deeply($api{get_actions}->(\%target)->{actions}[1]{secrets},
+            [{ %{ $action->{secrets}[0] }, name => 'Known_2' }, $action->{secrets}[1]],
+            'selected copy reserves destination pending aliases and keeps incoming pending aliases');
+        my $target_metadata = $api{get_secrets}->(\%target)->{secrets};
+        is_deeply([map { $_->{name} } grep { $_->{missing} } @$target_metadata], ['Known'],
+            'existing pending state is preserved and the existing value satisfies the incoming pending alias');
+        is_deeply([map { $_->{name} } grep { !$_->{missing} } @$target_metadata], ['Known_2', 'Missing'],
+            'target keeps its original value and receives the renamed copied value');
+        $preview = $api{inspect_copy_destination}->(\%fresh);
+        $api{copy_actions}->({
+            %guest, mode => 'empty', revision => $preview->{revision}, targetNode => $fresh{node}, targetVmid => $fresh{vmid},
+        });
+        is_deeply([map { $_->{name} } grep { $_->{missing} } @{ $api{get_secrets}->(\%fresh)->{secrets} }],
+            ['Missing', 'OtherMissing'], 'copying the full configuration preserves pending aliases');
+
+        $metadata = $save_secret->(\%guest, 'Missing', 'new value');
+        is_deeply([map { $_->{name} } grep { $_->{missing} } @{ $metadata->{secrets} }], ['OtherMissing'],
+            'saving a value fills the pending entry');
+        $run{revision} = $edited->{revision};
+        is($api{run_action}->({ %run }), 'UPID:fixture', 'filled action can run');
+        shift(@PVE::RPCEnvironment::workers)->();
+        is_deeply(\@resolved, ['existing value', 'new value'], 'execution uses both vault values');
+        my $overwritten;
+        {
+            local *PVE::EasyActions::API::read_guest_vault = sub { die "Vault unavailable for test.\n"; };
+            $overwritten = $api{import_actions}->({
+                %guest, revision => $edited->{revision}, mode => 'overwrite',
+                actions => JSON::PP::encode_json([$old_action]),
+            });
+        }
+        is_deeply($overwritten->{actions}, [$old_action], 'overwrite replaces the saved actions');
+        is_deeply($overwritten->{missingSecrets}, [], 'removed bindings no longer create a pending entry');
+        is_deeply([map { $_->{name} } @{ $api{get_secrets}->(\%guest)->{secrets} }], ['Known', 'Missing', 'Retained'],
+            'overwrite retains the existing vault');
     };
 
     subtest 'Copy saved container state and preserve secret bindings on append' => sub {

@@ -172,7 +172,7 @@
     function showSecrets(url, guestID, metadata) {
         const store = Ext.create('Ext.data.Store', {
             autoDestroy: true,
-            fields: ['name', 'updatedAt'],
+            fields: ['name', 'updatedAt', { name: 'missing', type: 'boolean' }],
         });
         let revision;
         let busy = false;
@@ -186,7 +186,9 @@
                     text: 'Last updated',
                     dataIndex: 'updatedAt',
                     width: 175,
-                    renderer: (value) => Ext.String.htmlEncode(Proxmox.Utils.render_timestamp(value)),
+                    renderer: (value, _cell, record) => record.get('missing')
+                        ? 'Not set'
+                        : Ext.String.htmlEncode(Proxmox.Utils.render_timestamp(value)),
                 },
             ],
             tbar: [
@@ -211,15 +213,19 @@
 
         function updateButtons() {
             const record = selectedRecord(grid);
-            grid.down('#add').setDisabled(store.getCount() >= maxSecrets);
-            grid.down('#rotate').setDisabled(!record);
-            grid.down('#delete').setDisabled(!record);
+            const missing = record?.get('missing');
+            const filledCount = store.getRange().filter((item) => !item.get('missing')).length;
+            grid.down('#add').setDisabled(filledCount >= maxSecrets);
+            const edit = grid.down('#rotate');
+            edit.setText(missing ? 'Set value' : 'Rotate');
+            edit.setDisabled(!record || (missing && filledCount >= maxSecrets));
+            grid.down('#delete').setDisabled(!record || missing);
         }
 
         function updateMetadata(data, selectedName) {
             revision = data.revision;
             grid.getSelectionModel().deselectAll();
-            store.loadData(data.secrets.map(({ name, updatedAt }) => ({ name, updatedAt })));
+            store.loadData(data.secrets.map(({ name, updatedAt, missing }) => ({ name, updatedAt, missing })));
             const row = selectedName && store.findRecord('name', selectedName, 0, false, true, true);
             if (row) {
                 grid.getSelectionModel().select(row);
@@ -252,18 +258,24 @@
                 return;
             }
             const name = record?.get('name');
-            const operation = name ? 'Rotate' : 'Create';
+            const missing = record?.get('missing');
+            const operation = missing ? 'Set value' : name ? 'Rotate' : 'Create';
             const fields = name ? [] : [nameField('', (value) => {
                 if (!secretNamePattern.test(value)) {
                     return 'Use up to 48 ASCII letters, digits, underscores or hyphens. Start with a letter.';
                 }
                 const exists = store.findRecord('name', value, 0, false, true, true);
-                return exists ? 'A secret with that name already exists. Use Rotate to replace its value.' : true;
+                if (exists) {
+                    return exists.get('missing')
+                        ? 'Select the existing secret and use Set value.'
+                        : 'A secret with that name already exists. Use Rotate to replace its value.';
+                }
+                return true;
             })];
             fields.push({
                 xtype: 'textareafield',
                 name: 'value',
-                fieldLabel: name ? 'New value' : 'Value',
+                fieldLabel: name && !missing ? 'New value' : 'Value',
                 height: 200,
                 allowBlank: false,
                 inputAttrTpl: 'autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false"',
@@ -275,10 +287,10 @@
                     return byteLength(value) <= maxSecretBytes || 'The value exceeds 32 KiB.';
                 },
             });
-            const title = name ? `Rotate ${Ext.String.htmlEncode(name)}` : 'Create secret';
+            const title = name ? `${operation} ${Ext.String.htmlEncode(name)}` : 'Create secret';
             editRecord(title, fields, (values) => {
                 const secretName = name || values.name;
-                setBusy(true, name ? 'Rotating secret…' : 'Creating secret…');
+                setBusy(true, 'Saving secret…');
                 request(url, 'PUT', { revision, name: secretName, value: values.value }, (data) => {
                     setBusy(false);
                     updateMetadata(data, secretName);
@@ -292,16 +304,18 @@
                     } else if (status >= 500) {
                         message = 'The Proxmox node could not save the secret. Check the node log.';
                     }
-                    Ext.Msg.alert(`Could not ${operation.toLowerCase()} secret`, status ? `${message} (${status})` : message);
+                    const failureTitle = missing ? 'Could not set secret value' : `Could not ${operation.toLowerCase()} secret`;
+                    Ext.Msg.alert(failureTitle, status ? `${message} (${status})` : message);
                 }, { redactError: true });
             }, { label: operation });
         }
 
         function removeSecret() {
-            const name = selectedRecord(grid)?.get('name');
-            if (busy || !name) {
+            const record = selectedRecord(grid);
+            if (busy || !record || record.get('missing')) {
                 return;
             }
+            const name = record.get('name');
             Ext.Msg.confirm('Delete secret', `Delete ${Ext.String.htmlEncode(name)}? Remove any action bindings first.`, (answer) => {
                 if (answer === 'yes') {
                     setBusy(true, 'Deleting secret…');
@@ -558,6 +572,8 @@
         function markDirty() {
             dirty = true;
             dialog.down('#save-actions').setDisabled(false);
+            dialog.down('#import-actions').setDisabled(true);
+            dialog.down('#import-status').show();
             updateCopyButton();
         }
 
@@ -813,6 +829,17 @@
 
         const viewport = Ext.getBody().getViewSize();
         const hasPreviousActions = config.previousActions?.length > 0;
+        const importInput = document.createElement('input');
+        importInput.type = 'file';
+        importInput.accept = '.json,application/json';
+        importInput.hidden = true;
+        importInput.addEventListener('change', () => {
+            const file = importInput.files[0];
+            importInput.value = '';
+            if (file) {
+                importFile(file);
+            }
+        });
         const dialog = Ext.create('Ext.window.Window', {
             title: `Actions · Config · Guest ${guestID}`,
             modal: true,
@@ -824,13 +851,26 @@
                 actions,
                 { xtype: 'tabpanel', region: 'center', items: [steps, bindings] },
                 {
-                    xtype: 'component',
+                    xtype: 'container',
                     region: 'south',
                     padding: 10,
-                    html: 'Steps run in order as root inside the guest, each in its own Bash process. Secret bindings are available to every step of the selected action.',
+                    items: [
+                        {
+                            xtype: 'component',
+                            html: 'Steps run in order as root inside the guest, each in its own Bash process. Secret bindings are available to every step of the selected action.',
+                        },
+                        {
+                            xtype: 'component',
+                            itemId: 'import-status',
+                            ariaRole: 'status',
+                            hidden: true,
+                            html: 'Save or discard your changes before importing actions.',
+                        },
+                    ],
                 },
             ],
             listeners: {
+                afterrender: (window) => window.el.dom.append(importInput),
                 beforeclose: () => {
                     if (saving) {
                         return false;
@@ -849,10 +889,111 @@
             },
             buttons: [
                 { text: 'Load previous actions', hidden: !hasPreviousActions, handler: loadPreviousActions },
+                {
+                    text: 'Import config',
+                    itemId: 'import-actions',
+                    tooltip: 'Import actions from a JSON file',
+                    handler: () => {
+                        if (!saving && !dirty) {
+                            importInput.click();
+                        }
+                    },
+                },
                 { text: 'Close', handler: () => dialog.close() },
                 { text: 'Save', itemId: 'save-actions', disabled: true, handler: saveConfig },
             ],
         });
+
+        function setSaving(state, label) {
+            saving = state;
+            dialog.down('#import-actions').setDisabled(saving || dirty);
+            updateCopyButton();
+            dialog.setLoading(label || false);
+        }
+
+        async function importFile(file) {
+            if (saving || dirty || dialog.destroyed) {
+                return;
+            }
+            if (file.size > 512 * 1024) {
+                Ext.Msg.alert('Configuration file too large', 'Choose a JSON file no larger than 512 KiB.');
+                return;
+            }
+            setSaving(true, 'Reading actions file…');
+
+            function importFailed(message) {
+                setSaving(false);
+                Ext.Msg.alert('Could not import actions', message);
+            }
+
+            let decoded;
+            try {
+                decoded = JSON.parse(await file.text());
+            } catch {
+                importFailed('Choose a valid Easy Actions JSON file.');
+                return;
+            }
+            const isExport = decoded?.format === 'proxmox-easy-actions' && decoded.version === 1
+                && Object.keys(decoded).length === 3;
+            const importedActions = isExport ? decoded.actions : decoded;
+            if (!Array.isArray(importedActions)) {
+                importFailed('Choose an Easy Actions export or a JSON array of actions.');
+                return;
+            }
+            if (importedActions.length > maxActions) {
+                importFailed('The JSON file can contain up to 12 actions.');
+                return;
+            }
+            const json = JSON.stringify(importedActions);
+            if (byteLength(json) > maxConfigBytes) {
+                importFailed('The imported actions exceed 96 KiB.');
+                return;
+            }
+
+            function saveImport(mode) {
+                dialog.setLoading('Importing actions…');
+                request(`${url}/import`, 'POST', { revision: config.revision, mode, actions: json }, (result) => {
+                    saving = false;
+                    dialog.close();
+
+                    const count = importedActions.length;
+                    const missing = result.missingSecrets?.length || 0;
+                    const summary = count ? `${count} ${count === 1 ? 'action' : 'actions'} imported.` : 'Configuration imported.';
+                    const next = missing
+                        ? ' Open <b>Actions → Secrets</b> and set the missing values before running the affected actions.'
+                        : '';
+                    Ext.Msg.show({
+                        title: 'Import complete',
+                        message: `${summary}${next}`,
+                        icon: Ext.Msg.INFO,
+                        buttons: Ext.Msg.OK,
+                    });
+                }, importFailed);
+            }
+
+            if (!config.actions.length) {
+                saveImport('append');
+                return;
+            }
+            dialog.setLoading(false);
+            Ext.Msg.show({
+                title: 'Import actions',
+                message: 'This guest already has saved actions.<br><br>'
+                    + '<b>Append</b> adds the imported actions after the existing ones. Matching action names get a suffix.<br><br>'
+                    + '<b>Overwrite</b> replaces the existing actions.<br><br>'
+                    + 'Bindings use the destination’s saved secret values.',
+                buttons: Ext.Msg.YESNOCANCEL,
+                buttonText: { yes: 'Append', no: 'Overwrite', cancel: 'Cancel' },
+                defaultFocus: '#cancel',
+                fn: (answer) => {
+                    if (answer === 'yes' || answer === 'no') {
+                        saveImport(answer === 'yes' ? 'append' : 'overwrite');
+                    } else {
+                        setSaving(false);
+                    }
+                },
+            });
+        }
 
         function loadPreviousActions() {
             Ext.Msg.confirm(
@@ -885,17 +1026,13 @@
                 return;
             }
 
-            saving = true;
-            updateCopyButton();
-            dialog.setLoading('Saving actions…');
+            setSaving(true, 'Saving actions…');
             request(url, 'PUT', { revision: config.revision, actions: json }, () => {
                 saving = false;
                 dirty = false;
                 dialog.close();
             }, (message) => {
-                saving = false;
-                updateCopyButton();
-                dialog.setLoading(false);
+                setSaving(false);
                 Ext.Msg.alert('Could not save actions', message);
             });
         }
@@ -910,24 +1047,26 @@
         updateGridButtons(bindings, maxBindings, !!selectedRecord(actions));
     }
 
-    function showCopy(url, guestID, action) {
+    function showCopy(url, guestID, action, sourceType = 'lxc') {
         const targetKind = action ? 'guest' : 'container';
-        const store = Ext.create('Ext.data.Store', {
+        const downloadOnly = !action && sourceType === 'qemu';
+        const store = downloadOnly ? null : Ext.create('Ext.data.Store', {
             autoDestroy: true,
             fields: [{ name: 'vmid', type: 'int' }, 'node', 'type', 'label'],
             sorters: ['vmid'],
         });
-        const target = Ext.create('Ext.form.field.ComboBox', {
+        const target = downloadOnly ? null : Ext.create('Ext.form.field.ComboBox', {
             itemId: 'copy-target',
             fieldLabel: action ? 'Target VM or CT' : 'Target container',
             labelWidth: 120,
             anchor: '100%',
-            emptyText: 'Search by VMID, name or node',
+            emptyText: `Loading ${targetKind}s…`,
             store,
             queryMode: 'local',
             anyMatch: true,
             forceSelection: true,
             allowBlank: false,
+            readOnly: true,
             valueField: 'vmid',
             displayField: 'label',
             listConfig: {
@@ -935,11 +1074,14 @@
                 getInnerTpl: () => '{label:htmlEncode}',
             },
         });
-        let busy = true;
+        let busy = Boolean(action);
+        let downloading = false;
+        const title = action ? `Copy action · ${Ext.String.htmlEncode(action.name)}`
+            : downloadOnly ? `Download actions config · VM ${guestID}` : `Copy actions and secrets · CT ${guestID}`;
         const dialog = Ext.create('Ext.window.Window', {
-            title: action ? `Copy action · ${Ext.String.htmlEncode(action.name)}` : `Copy actions and secrets · CT ${guestID}`,
+            title,
             modal: true,
-            defaultFocus: '#copy-target',
+            defaultFocus: downloadOnly ? '#download-config' : '#copy-target',
             width: Math.min(580, Ext.getBody().getViewSize().width - 24),
             layout: 'fit',
             items: [{
@@ -947,20 +1089,55 @@
                 border: false,
                 bodyPadding: 12,
                 items: [
-                    target,
-                    ...(action ? [{
+                    ...(target ? [target] : []),
+                    {
                         xtype: 'component',
-                        margin: '8 0 0',
-                        html: 'Adds the selected action and its bound secrets. Matching names get a suffix.',
-                    }] : []),
+                        html: action ? 'Adds the selected action and its bound secrets. Matching names get a suffix.'
+                            : 'The file includes saved actions and secret bindings. Set any missing secret values on the destination before running imported actions.',
+                    },
                 ],
                 buttons: [
-                    { text: 'Cancel', handler: () => dialog.close() },
-                    { text: 'Copy', formBind: true, disabled: true, handler: checkTarget },
+                    ...(!action ? [{ text: 'Download config', itemId: 'download-config', handler: downloadConfig }] : []),
+                    { text: downloadOnly ? 'Close' : 'Cancel', handler: () => dialog.close() },
+                    ...(target ? [{ text: 'Copy', formBind: true, disabled: true, handler: checkTarget }] : []),
                 ],
             }],
-            listeners: { beforeclose: () => !busy },
+            listeners: { beforeclose: () => !busy && !downloading },
         });
+
+        function downloadConfig() {
+            if (busy || downloading) {
+                return;
+            }
+            const button = dialog.down('#download-config');
+            downloading = true;
+            button.setDisabled(true);
+            request(url, 'GET', undefined, (config) => {
+                downloading = false;
+                button.setDisabled(false);
+                const exportData = {
+                    format: 'proxmox-easy-actions',
+                    version: 1,
+                    actions: config.actions.map(copyAction),
+                };
+                const blob = new Blob([JSON.stringify(exportData, null, 2), '\n'], { type: 'application/json' });
+                const objectUrl = URL.createObjectURL(blob);
+                const link = document.createElement('a');
+                link.href = objectUrl;
+                link.download = `easy-actions-${sourceType}-${guestID}.json`;
+                document.body.append(link);
+                try {
+                    link.click();
+                } finally {
+                    link.remove();
+                    setTimeout(() => URL.revokeObjectURL(objectUrl), 1000);
+                }
+            }, (message) => {
+                downloading = false;
+                button.setDisabled(false);
+                Ext.Msg.alert('Could not download config', message);
+            });
+        }
 
         function copyFailed(message) {
             busy = false;
@@ -970,7 +1147,7 @@
 
         function checkTarget() {
             const record = target.findRecordByValue(target.getValue());
-            if (busy || !record) {
+            if (busy || downloading || !record) {
                 return;
             }
             const targetVmid = record.get('vmid');
@@ -1030,8 +1207,16 @@
         }
 
         dialog.show();
-        dialog.setLoading(`Loading ${targetKind}s…`);
+        if (downloadOnly) {
+            return dialog;
+        }
+        if (action) {
+            dialog.setLoading(`Loading ${targetKind}s…`);
+        }
         request('/cluster/resources?type=vm', 'GET', undefined, (resources) => {
+            if (dialog.destroyed) {
+                return;
+            }
             const targets = resources.filter(({ type, vmid, node, template }) =>
                 (type === 'lxc' || (action && type === 'qemu'))
                 && node && Number(vmid) !== Number(guestID) && !Number(template),
@@ -1042,12 +1227,23 @@
             dialog.setLoading(false);
             if (targets.length) {
                 store.loadData(targets);
+                target.setEmptyText('Search by VMID, name or node');
+                target.setReadOnly(false);
+            } else if (!action) {
+                target.setEmptyText('No other containers available');
             } else {
                 dialog.close();
                 Ext.Msg.alert(`No target ${targetKind}`, `No other ${targetKind}s are available.`);
             }
         }, (message) => {
+            if (dialog.destroyed) {
+                return;
+            }
             busy = false;
+            if (!action) {
+                target.setEmptyText('Could not load containers');
+                return;
+            }
             dialog.close();
             Ext.Msg.alert(`Could not load ${targetKind}s`, message);
         });
@@ -1126,18 +1322,16 @@
         const utilityItems = [
             { text: 'Config', iconCls: 'fa fa-fw fa-cog', handler: openConfig },
             { text: 'Secrets', iconCls: 'fa fa-fw fa-key', handler: openSecrets },
-        ];
-        if (type === 'lxc') {
-            utilityItems.push({
+            {
                 text: 'Copy',
                 iconCls: 'fa fa-fw fa-copy',
                 handler: () => {
                     if (!copyDialog || copyDialog.destroyed) {
-                        copyDialog = showCopy(url, guestID);
+                        copyDialog = showCopy(url, guestID, undefined, type);
                     }
                 },
-            });
-        }
+            },
+        ];
         const utilityItemCount = utilityItems.length;
 
         function replaceActions(menu, items) {
@@ -1161,7 +1355,7 @@
                 for (const { name, group } of config.actions) {
                     const item = {
                         text: Ext.String.htmlEncode(
-                            name.toLowerCase() === 'secrets' || (type === 'lxc' && name.toLowerCase() === 'copy')
+                            name.toLowerCase() === 'secrets' || name.toLowerCase() === 'copy'
                                 ? `Run ${name}` : name,
                         ),
                         iconCls: 'fa fa-fw fa-play',

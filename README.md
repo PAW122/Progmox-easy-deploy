@@ -28,7 +28,7 @@ Refresh the desktop web interface and sign in as `root@pam`.
 If you have a source checkout, run `bash scripts/build-deb.sh` on Debian, Ubuntu, or Proxmox VE with `bash` and `dpkg-deb` installed. Copy the `.deb` file from `dist/` or a project release to the node. Run this command as `root` from the directory containing the package.
 
 ```bash
-apt install ./proxmox-easy-actions_0.3.5_all.deb
+apt install ./proxmox-easy-actions_0.3.6_all.deb
 ```
 
 ## Update
@@ -96,6 +96,12 @@ On the source container, open **Actions → Copy** and select another LXC contai
 For a target on another node, install the same version of the add-on on both nodes. The copy uses the cluster's trusted SSH connection and the destination node encrypts the secrets with its own key.
 
 To copy one action, open **Actions → Config**, select a saved action, and click **Copy**. Choose another VM or LXC container. The copy is added to the destination with the secrets bound to that action. Existing actions and secrets are kept, and duplicate names receive the same suffixes as **Append**.
+
+### Transferring a configuration by file
+
+1. On the source VM or container, open **Actions → Copy → Download config**. The JSON file contains the saved actions, groups, steps, and secret binding names, modes, and variables.
+2. On the destination, open **Actions → Config → Import config** and select the file. **Append** adds the imported actions after the existing list and renames duplicates. **Overwrite** replaces the destination action list.
+3. In **Actions → Secrets**, select each entry marked **Not set** and choose **Set value**. Imported bindings can use values already configured under the same name on the destination. Set the required values before running the imported actions.
 
 ## Secrets
 

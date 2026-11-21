@@ -27,12 +27,19 @@ sub append {
     my ($actions, $secrets, $incoming_actions, $incoming_secrets) = @_;
     my %action_names = map { fc($_->{name}) => 1 } (@$actions, @$incoming_actions);
     my %existing_actions = map { fc($_->{name}) => 1 } @$actions;
-    my %secret_names = map { $_ => 1 } (keys %$secrets, keys %$incoming_secrets);
+    my %existing_secret_names = map { $_ => 1 } keys %$secrets;
+    for my $action (@$actions) {
+        $existing_secret_names{$_->{name}} = 1 for @{ $action->{secrets} // [] };
+    }
+    my %secret_names = (%existing_secret_names, map { $_ => 1 } keys %$incoming_secrets);
+    for my $action (@$incoming_actions) {
+        $secret_names{$_->{name}} = 1 for @{ $action->{secrets} // [] };
+    }
     my %bindings;
 
     my %combined_secrets = %$secrets;
     for my $name (sort keys %$incoming_secrets) {
-        my $destination = exists($secrets->{$name})
+        my $destination = $existing_secret_names{$name}
             ? available_name($name, \%secret_names, 48, sub { "_$_[0]" }, sub { $_[0] })
             : $name;
         $bindings{$name} = $destination;
@@ -48,7 +55,7 @@ sub append {
             );
         }
         if ($action->{secrets}) {
-            $copy{secrets} = [map { { %$_, name => $bindings{$_->{name}} } } @{ $action->{secrets} }];
+            $copy{secrets} = [map { { %$_, name => $bindings{$_->{name}} // $_->{name} } } @{ $action->{secrets} }];
         }
         push @combined_actions, \%copy;
     }
